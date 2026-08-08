@@ -1,0 +1,15 @@
+services:
+  wlm-viewer:
+    build: .
+    ports:
+      - "2512:5000"
+    volumes:
+      - /volume1/Public:/photos:rw
+      - /volume1/Public/wlm-viewer-v2/app.py:/app/app.py:ro
+      - /volume1/Public/wlm-viewer-v2/templates:/app/templates:rw
+      - /volume1/Public/wlm-viewer-v2/static:/app/static:ro
+      - /volume1/Public/wlm-viewer-v2/thumbs:/tmp/wlm_thumbs:rw
+    restart: unless-stopped
+    environment:
+      - PHOTOS_DIR=/photos
+      - WLM_PASSWORD=Yellowmango1!
