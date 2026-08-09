@@ -2139,8 +2139,15 @@ async function selectFolder(name, el) {
     // away while this background refresh was in flight.
     if (currentFolder === name) _applyListing(resp);
   } catch(e) {
-    if (!cached) {
-      $('stateMsg').textContent = 'Failed to load photos';
+    // Offline with nothing cached for this folder yet -- if something is
+    // queued to land here, still show that (an otherwise-real folder
+    // load failing shouldn't hide a pending move into it), rather than a
+    // hard error implying nothing can be shown at all.
+    const hasIncoming = _isOffline && _offlineQueue.some(a => a.kind === 'move' && a.body.to === name);
+    if (hasIncoming) {
+      if (currentFolder === name) _applyListing([]);
+    } else if (!cached) {
+      $('stateMsg').textContent = _isOffline ? 'Offline — this folder hasn\'t been viewed yet' : 'Failed to load photos';
       $('stateMsg').style.display = 'flex';
     }
   }
