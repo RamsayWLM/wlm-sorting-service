@@ -22,8 +22,10 @@ import atexit
 import json
 import os
 import signal
+import subprocess
 import sys
 import threading
+import time
 import tkinter as tk
 import webbrowser
 from pathlib import Path
@@ -72,7 +74,7 @@ _setup_bundled_tools()
 # most Macs out of the box — Flask's own default port would collide with it
 # on a fresh client machine. Docker deploys set PORT themselves via compose,
 # so this only fills the gap for a plain double-clicked client build.
-os.environ.setdefault('PORT', '58620')
+os.environ.setdefault('PORT', '2514')
 
 CONFIG_DIR = Path.home() / 'Library' / 'Application Support' / 'WLM Sorting Service'
 CONFIG_FILE = CONFIG_DIR / 'config.json'
@@ -134,12 +136,21 @@ def _save_config(cfg: dict):
 def _restart_app():
     """Full process restart so app.py (and its module-level BASE) picks up
     a newly-chosen PHOTOS_DIR. Once `app` is imported, BASE is fixed for the
-    life of the process — there's no clean way to re-point it in place."""
-    python = sys.executable
+    life of the process — there's no clean way to re-point it in place.
+
+    Spawns a genuinely new process rather than self-exec'ing in place
+    (os.execv): PyInstaller's frozen macOS bootloader does a one-time
+    task-policy setup that breaks when re-exec'd into the same process,
+    leaving the app stuck with the old server still bound to the port.
+    Launching fresh via `open -n` and then exiting avoids that; the new
+    process's own bind-retry loop (see _run_server) absorbs the brief
+    window where the old process hasn't released the port yet."""
     if getattr(sys, 'frozen', False):
-        os.execv(python, [python])
+        app_bundle = Path(sys.executable).resolve().parents[2]  # Contents/MacOS/exe -> the .app itself
+        subprocess.Popen(['open', '-n', str(app_bundle)])
     else:
-        os.execv(python, [python, os.path.abspath(__file__)])
+        subprocess.Popen([sys.executable, os.path.abspath(__file__)])
+    os._exit(0)
 
 
 def _import_server_app(photos_dir: str):
@@ -309,7 +320,18 @@ class ServiceShell:
                 return
             self._set_status(STATUS_READY)
             port = int(os.environ.get('PORT', 5000))
-            server_app.app.run(host=bind_host, port=port, threaded=True, use_reloader=False)
+            # A folder change spawns a new process before the old one has
+            # necessarily released the port yet (see _restart_app) — retry
+            # the bind for a few seconds rather than surfacing that brief
+            # overlap as a crash.
+            for attempt in range(10):
+                try:
+                    server_app.app.run(host=bind_host, port=port, threaded=True, use_reloader=False)
+                    break
+                except OSError:
+                    if attempt == 9 or self._stopped:
+                        raise
+                    time.sleep(1)
         except Exception:
             pass
         if not self._stopped:
