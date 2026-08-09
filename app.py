@@ -2350,8 +2350,26 @@ def _tailscale_binary():
     return 'tailscale'
 
 
+def _tailscale_ip_is_live(ip: str) -> bool:
+    """`tailscale ip -4` keeps returning the last-known address (exit code 0,
+    no error) even after Tailscale has been stopped/disconnected — it's
+    reporting the tailnet identity, not current connectivity. Cross-check
+    against the machine's actual network interfaces so a stopped Tailscale
+    doesn't get treated as connected, which would otherwise bind to a dead
+    address and fail with "Can't assign requested address"."""
+    try:
+        for addrs in psutil.net_if_addrs().values():
+            for addr in addrs:
+                if addr.address == ip:
+                    return True
+    except Exception:
+        pass
+    return False
+
+
 def _get_tailscale_ip(retry_interval=5):
-    """Block until `tailscale ip -4` returns an address, then return it.
+    """Block until Tailscale is actually connected with a live address, then
+    return it.
 
     This is a client-facing build: the server must never be reachable except
     over Tailscale, so we retry forever rather than falling back to
@@ -2364,7 +2382,7 @@ def _get_tailscale_ip(retry_interval=5):
                 capture_output=True, text=True, timeout=5,
             )
             lines = result.stdout.strip().splitlines()
-            if result.returncode == 0 and lines:
+            if result.returncode == 0 and lines and _tailscale_ip_is_live(lines[0]):
                 return lines[0]
         except (FileNotFoundError, subprocess.TimeoutExpired):
             pass

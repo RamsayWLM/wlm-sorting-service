@@ -493,27 +493,30 @@ class ServiceShell:
         self.root.after(0, _update)
 
     def _run_server(self):
-        try:
-            self._set_status('waiting')
-            bind_host = server_app._get_tailscale_ip()
-            if self._stopped:
-                return
-            self._set_status('ready')
-            port = int(os.environ.get('PORT', 5000))
-            # A folder change spawns a new process before the old one has
-            # necessarily released the port yet (see _restart_app) — retry
-            # the bind for a few seconds rather than surfacing that brief
-            # overlap as a crash.
-            for attempt in range(10):
-                try:
-                    server_app.app.run(host=bind_host, port=port, threaded=True, use_reloader=False)
-                    break
-                except OSError:
-                    if attempt == 9 or self._stopped:
-                        raise
-                    time.sleep(1)
-        except Exception:
-            pass
+        # Outer loop re-fetches the Tailscale IP on every bind failure rather
+        # than retrying the same address — Tailscale can stop/restart with a
+        # different (or the same, briefly-stale) address mid-session, and
+        # _get_tailscale_ip() itself blocks correctly on "not really
+        # connected" now. This runs indefinitely rather than giving up,
+        # since Tailscale being down could last anywhere from a second (the
+        # old-process handoff on a folder change) to however long the client
+        # takes to notice and reconnect it.
+        port = int(os.environ.get('PORT', 5000))
+        while not self._stopped:
+            try:
+                self._set_status('waiting')
+                bind_host = server_app._get_tailscale_ip()
+                if self._stopped:
+                    return
+                self._set_status('ready')
+                server_app.app.run(host=bind_host, port=port, threaded=True, use_reloader=False)
+                return  # app.run() only returns on a real shutdown, not expected here
+            except OSError:
+                if self._stopped:
+                    return
+                time.sleep(2)
+            except Exception:
+                break
         if not self._stopped:
             self._set_status('crashed')
 
