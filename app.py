@@ -1616,9 +1616,12 @@ def api_cache_delete_all():
     return jsonify({'deleted': total})
 
 
-@app.route('/api/cache-wipe-all', methods=['DELETE'])
-def api_cache_wipe_all():
-    """Delete every cached thumbnail, including ones not tracked by the bulk-cache feature."""
+def _wipe_all_cache() -> int:
+    """Delete every cached thumbnail, including ones not tracked by the
+    bulk-cache feature. Returns the number of thumbnails deleted. Factored
+    out of the route so the client shell's own "Delete cache" button can
+    call this directly in-process, without going through the login-gated
+    HTTP endpoint."""
     count = 0
     if THUMB_DIR.exists():
         count = sum(1 for _ in THUMB_DIR.rglob('*.jpg'))
@@ -1626,7 +1629,13 @@ def api_cache_wipe_all():
         THUMB_DIR.mkdir(parents=True, exist_ok=True)
     _save_cache_meta({'folders': {}, 'cleanup_log': []})
     _thumb_stats_cache.update({'bytes': 0, 'count': 0, 'ts': time.time()})
-    return jsonify({'deleted': count})
+    return count
+
+
+@app.route('/api/cache-wipe-all', methods=['DELETE'])
+def api_cache_wipe_all():
+    """Delete every cached thumbnail, including ones not tracked by the bulk-cache feature."""
+    return jsonify({'deleted': _wipe_all_cache()})
 
 
 @app.route('/api/timestamps/<path:folder>')

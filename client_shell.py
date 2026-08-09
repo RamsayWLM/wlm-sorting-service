@@ -29,7 +29,7 @@ import time
 import tkinter as tk
 import webbrowser
 from pathlib import Path
-from tkinter import filedialog
+from tkinter import filedialog, messagebox
 
 from PIL import Image, ImageTk
 
@@ -93,11 +93,6 @@ SETUP_STEPS_TEXT = (
     "click Done."
 )
 
-STATUS_STARTING = "Starting sorting service..."
-STATUS_WAITING_TAILSCALE = "Waiting for Tailscale connection...\n(make sure you're signed in to Tailscale)"
-STATUS_READY = "Sorting service ready\nWaiting for connection"
-STATUS_CRASHED = "Sorting service stopped unexpectedly\nPlease contact White Lights Media"
-
 _COL_BG = "#181818"
 _COL_FG = "#e0e0e0"
 _COL_FG_DIM = "#707070"
@@ -105,6 +100,18 @@ _COL_ACCENT = "#d4a017"
 _COL_BTN = "#404040"
 _COL_BTN_FG = "#ffffff"
 _COL_BTN_DISABLED = "#2a2a2a"
+_COL_GREEN = "#2ecc71"
+_COL_YELLOW = "#e6b800"
+_COL_RED = "#e74c3c"
+
+# Keyed status states: each drives both the dot color and the message text,
+# kept together so they can never drift out of sync with each other.
+STATUS_STATES = {
+    'starting': {'text': "Starting sorting service...", 'color': _COL_FG_DIM},
+    'waiting': {'text': "Not connected\n(waiting for Tailscale)", 'color': _COL_YELLOW},
+    'ready': {'text': "Sorting service ready\nWaiting for connection", 'color': _COL_GREEN},
+    'crashed': {'text': "Sorting service stopped unexpectedly\nPlease contact White Lights Media", 'color': _COL_RED},
+}
 
 
 def _make_button(parent, text, command, bg, fg, bold=False, font_size=12):
@@ -281,7 +288,7 @@ class ServiceShell:
 
     def _begin_serving(self, folder):
         self._clear()
-        self.root.geometry("360x270")
+        self.root.geometry("360x320")
 
         logo = self._logo_image(180)
         if logo:
@@ -291,19 +298,31 @@ class ServiceShell:
             dot.create_oval(2, 2, 14, 14, fill=_COL_ACCENT, outline="")
             dot.pack(pady=(24, 8))
 
-        self.status_var = tk.StringVar(value=STATUS_STARTING)
+        status_row = tk.Frame(self.root, bg=_COL_BG)
+        status_row.pack(pady=4, expand=True)
+
+        self._status_dot = tk.Canvas(status_row, width=12, height=12, bg=_COL_BG, highlightthickness=0)
+        self._status_dot_oval = self._status_dot.create_oval(2, 2, 10, 10, fill=_COL_FG_DIM, outline="")
+        self._status_dot.pack(side="left", padx=(0, 8))
+
+        self.status_var = tk.StringVar(value=STATUS_STATES['starting']['text'])
         tk.Label(
-            self.root, textvariable=self.status_var, fg=_COL_FG, bg=_COL_BG,
-            font=("-apple-system", 13), wraplength=320, justify="center",
-        ).pack(pady=4, expand=True)
+            status_row, textvariable=self.status_var, fg=_COL_FG, bg=_COL_BG,
+            font=("-apple-system", 13), wraplength=280, justify="left",
+        ).pack(side="left")
 
         tk.Label(
             self.root, text=f"Working folder: {folder}", fg=_COL_FG_DIM, bg=_COL_BG,
             font=("-apple-system", 10), wraplength=320, justify="center",
-        ).pack(pady=(0, 2))
+        ).pack(pady=(0, 10))
 
         _make_button(
             self.root, "Change folder...", self._on_change_folder,
+            bg=_COL_BG, fg=_COL_FG_DIM, font_size=10,
+        ).pack(pady=(0, 2))
+
+        _make_button(
+            self.root, "Delete cache...", self._on_delete_cache,
             bg=_COL_BG, fg=_COL_FG_DIM, font_size=10,
         ).pack(pady=(0, 4))
 
@@ -322,16 +341,38 @@ class ServiceShell:
             self._stopped = True
             _restart_app()
 
-    def _set_status(self, text):
-        self.root.after(0, lambda: self.status_var.set(text))
+    def _on_delete_cache(self):
+        proceed = messagebox.askyesno(
+            "Delete cache?",
+            "Only delete the cache once White Lights Media has finished "
+            "working on this competition — deleting it early may slow down "
+            "their workflow while they're still sorting your photos.\n\n"
+            "Delete cache now?",
+            icon='warning',
+        )
+        if not proceed:
+            return
+        try:
+            count = server_app._wipe_all_cache()
+            messagebox.showinfo("Cache deleted", f"Cache cleared ({count} thumbnails removed).")
+        except Exception:
+            messagebox.showerror("Error", "Could not delete the cache. Please contact White Lights Media.")
+
+    def _set_status(self, state_key):
+        state = STATUS_STATES[state_key]
+
+        def _update():
+            self.status_var.set(state['text'])
+            self._status_dot.itemconfig(self._status_dot_oval, fill=state['color'])
+        self.root.after(0, _update)
 
     def _run_server(self):
         try:
-            self._set_status(STATUS_WAITING_TAILSCALE)
+            self._set_status('waiting')
             bind_host = server_app._get_tailscale_ip()
             if self._stopped:
                 return
-            self._set_status(STATUS_READY)
+            self._set_status('ready')
             port = int(os.environ.get('PORT', 5000))
             # A folder change spawns a new process before the old one has
             # necessarily released the port yet (see _restart_app) — retry
@@ -348,7 +389,7 @@ class ServiceShell:
         except Exception:
             pass
         if not self._stopped:
-            self._set_status(STATUS_CRASHED)
+            self._set_status('crashed')
 
     def _on_signal(self, signum, frame):
         self._stopped = True
