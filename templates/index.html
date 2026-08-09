@@ -5091,7 +5091,7 @@ async function _sendOrQueue(kind, url, bodyObj) {
   }
   async function _pollSystemStats() {
     try {
-      const r = await _fetchWithTimeout('/api/system-stats', {}, 4000);
+      const r = await _fetchWithTimeout('/api/system-stats', {}, 2000);
       if (!r.ok) throw new Error('bad status');
       const d = await r.json();
       _setOffline(false);
