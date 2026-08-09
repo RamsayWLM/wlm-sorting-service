@@ -155,6 +155,14 @@ def _restart_app():
 
 def _import_server_app(photos_dir: str):
     os.environ['PHOTOS_DIR'] = photos_dir
+    # On the NAS deploy, THUMB_DIR (default /tmp/wlm_thumbs) is deliberately
+    # bind-mounted to persistent storage so the thumbnail cache survives
+    # container restarts. A bare-metal Mac has no such mount — macOS
+    # periodically sweeps files in /tmp that haven't been touched in a few
+    # days — so point it at our own persistent app-support folder instead.
+    # This is independent of PHOTOS_DIR/BASE, so changing folder later never
+    # touches or clears it.
+    os.environ.setdefault('THUMB_DIR', str(CONFIG_DIR / 'thumbs'))
     global server_app
     import app as server_app
 
@@ -273,7 +281,7 @@ class ServiceShell:
 
     def _begin_serving(self, folder):
         self._clear()
-        self.root.geometry("360x240")
+        self.root.geometry("360x270")
 
         logo = self._logo_image(180)
         if logo:
@@ -288,6 +296,11 @@ class ServiceShell:
             self.root, textvariable=self.status_var, fg=_COL_FG, bg=_COL_BG,
             font=("-apple-system", 13), wraplength=320, justify="center",
         ).pack(pady=4, expand=True)
+
+        tk.Label(
+            self.root, text=f"Working folder: {folder}", fg=_COL_FG_DIM, bg=_COL_BG,
+            font=("-apple-system", 10), wraplength=320, justify="center",
+        ).pack(pady=(0, 2))
 
         _make_button(
             self.root, "Change folder...", self._on_change_folder,
