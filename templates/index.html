@@ -234,6 +234,13 @@
     -webkit-text-stroke: 0.5px rgba(0,0,0,0.9);
     text-shadow: 0 0 4px rgba(0,0,0,1), 0 0 2px rgba(0,0,0,1);
   }
+  /* Offline mode: item shown where it will land once reconnected, not really there yet */
+  .grid-cell.pending-offline .img-wrap img { opacity: 0.45 !important; }
+  .pending-badge {
+    position: absolute; top: 3px; right: 4px; z-index: 3;
+    font-size: 12px; line-height: 1; pointer-events: none;
+    filter: drop-shadow(0 0 2px rgba(0,0,0,0.9));
+  }
 
   /* cache status ticks */
   .cache-badges {
@@ -2092,6 +2099,7 @@ async function selectFolder(name, el) {
   const _applyListing = (resp) => {
     // Support both old (plain array) and new ({items, truncated}) API formats
     allMedia = Array.isArray(resp) ? resp : resp.items;
+    if (_offlineQueue.length) allMedia = _applyOfflineOverlay(name, allMedia);
     truncatedNote = (!Array.isArray(resp) && resp.truncated) ? `first ${resp.limit.toLocaleString()} shown` : '';
     filtered = [...allMedia];
 
@@ -2378,8 +2386,10 @@ function buildCellHTML(m, i) {
       : '';
   const starBadge = _starsHtml(m.rating || 0);
   const selCls = selected.has(i) ? ' selected' : '';
+  const pendingCls = m._pendingOffline ? ' pending-offline' : '';
+  const pendingBadge = m._pendingOffline ? `<span class="pending-badge" title="Will move here once reconnected">⏳</span>` : '';
   const fc     = _faceCropLevel === 1 ? ' face' : _faceCropLevel === 2 ? ' face2' : _faceCropLevel === 3 ? ' face3' : '';
-  return `<div class="grid-cell${selCls}" data-idx="${i}" data-path="${m.path.replace(/"/g,'&quot;')}" draggable="true"
+  return `<div class="grid-cell${selCls}${pendingCls}" data-idx="${i}" data-path="${m.path.replace(/"/g,'&quot;')}" draggable="true"
                onclick="cellClick(event,${i})"
                ondblclick="openLb(${i})">
     <div class="cell-label-bar ${lcClass}"></div>
@@ -2387,6 +2397,7 @@ function buildCellHTML(m, i) {
       <img src="${thumb}" loading="lazy" class="${fc}" alt="">
       ${flagBadge}
       ${starBadge}
+      ${pendingBadge}
       ${_cacheBadgesHtml(m)}
       <div class="athlete-lbl">${m.name||''}</div>
       ${play}
@@ -4964,6 +4975,35 @@ if (_isOffline) document.addEventListener('DOMContentLoaded', () => _updateOffli
 
 function _saveOfflineQueue() {
   try { localStorage.setItem('wlm-offline-queue', JSON.stringify(_offlineQueue)); } catch(e) {}
+}
+
+const _VIDEO_EXTS_OFFLINE = new Set(['mp4', 'mov', 'm4v', 'avi', 'mkv', 'mts']);
+
+// Shows where queued moves will actually land, and hides their old spot, so
+// browsing while offline reflects the pending changes rather than the
+// filesystem's real (not-yet-updated) state. The item's `path` is kept as
+// its REAL current location (not the destination) since that's the only
+// path a thumbnail can actually be fetched from until the real move happens.
+function _applyOfflineOverlay(folderName, items) {
+  const queuedPaths = new Set();
+  const incoming = [];
+  for (const action of _offlineQueue) {
+    if (action.kind !== 'move') continue;
+    for (const p of (action.body.paths || [])) {
+      queuedPaths.add(p);
+      if (action.body.to === folderName) {
+        const name = p.split('/').pop();
+        const ext = (name.includes('.') ? name.split('.').pop() : '').toLowerCase();
+        incoming.push({
+          path: p, name,
+          type: _VIDEO_EXTS_OFFLINE.has(ext) ? 'video' : 'photo',
+          athlete: '', rating: 0, flag: 'none', label: 'none',
+          _pendingOffline: true,
+        });
+      }
+    }
+  }
+  return items.filter(it => !queuedPaths.has(it.path)).concat(incoming);
 }
 
 function _describeOfflineAction(action) {
