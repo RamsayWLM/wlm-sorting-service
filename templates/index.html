@@ -977,7 +977,13 @@ let _zoomPx       = 250;
 let _hoveredFolder = null;
 
 async function api(url) {
-  const r = await fetch(url);
+  let r;
+  try {
+    r = await _fetchWithTimeout(url, {}, 6000);
+  } catch (e) {
+    _setOffline(true);
+    throw e;
+  }
   if (!r.ok) throw new Error(r.status);
   return r.json();
 }
@@ -5029,16 +5035,31 @@ async function _replayOfflineQueue() {
   if (typeof _refreshTreeAt === 'function') { try { await _refreshTreeAt(null); } catch(e) {} }
 }
 
+// fetch() has no default timeout — if a dropped connection black-holes
+// packets instead of immediately refusing them (plausible when the server
+// and browser are on the very same machine and Tailscale's interface just
+// disappears), a plain fetch can hang far longer than any of this is
+// useful for, instead of failing fast enough to detect "offline" promptly.
+async function _fetchWithTimeout(url, options, timeoutMs) {
+  const controller = new AbortController();
+  const t = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...options, signal: controller.signal });
+  } finally {
+    clearTimeout(t);
+  }
+}
+
 // Sends a sort action if online; queues it (and fakes a plausible success
 // response so the caller's existing .json()-handling code still updates the
 // UI, exactly as if the server had confirmed it) if offline.
 async function _sendOrQueue(kind, url, bodyObj) {
   if (!_isOffline) {
     try {
-      return await fetch(url, {
+      return await _fetchWithTimeout(url, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(bodyObj),
-      });
+      }, 5000);
     } catch (e) {
       _setOffline(true);  // fall through to queueing now that we know we're offline
     }
@@ -5070,7 +5091,7 @@ async function _sendOrQueue(kind, url, bodyObj) {
   }
   async function _pollSystemStats() {
     try {
-      const r = await fetch('/api/system-stats');
+      const r = await _fetchWithTimeout('/api/system-stats', {}, 4000);
       if (!r.ok) throw new Error('bad status');
       const d = await r.json();
       _setOffline(false);
