@@ -563,6 +563,7 @@
 </style>
 </head>
 <body>
+<div id="offlineBanner" style="display:none;position:fixed;top:0;left:0;right:0;z-index:5000;background:#e74c3c;color:#fff;text-align:center;font-size:12px;padding:5px 0;font-weight:600"></div>
 <div class="app">
 <div class="main">
 
@@ -1191,11 +1192,7 @@ async function moveSelectedTo(targetFolder) {
     const chunk = toMove.slice(s, s + MOVE_CHUNK);
     let data;
     try {
-      const res = await fetch('/api/move', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ paths: chunk, to: targetFolder })
-      });
+      const res = await _sendOrQueue('move', '/api/move', { paths: chunk, to: targetFolder });
       data = await res.json();
     } catch(e) {
       $('statusLeft').textContent = 'Move failed — network error';
@@ -3722,11 +3719,7 @@ async function submitRename() {
   const target = _renameTarget;
   closeRenameModal();
   try {
-    const res = await fetch('/api/rename', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ path: target, name: newName })
-    });
+    const res = await _sendOrQueue('rename', '/api/rename', { path: target, name: newName });
     const data = await res.json();
     if (!res.ok || data.error) {
       $('statusLeft').textContent = data.error || 'Rename failed';
@@ -3866,11 +3859,7 @@ async function moveFolderTo(srcPath, destPath) {
   $('statusLeft').textContent = `Moving "${srcName}" to "${destName}"…`;
   let data;
   try {
-    const res = await fetch('/api/move-folder', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ src: srcPath, dest: destPath })
-    });
+    const res = await _sendOrQueue('move-folder', '/api/move-folder', { src: srcPath, dest: destPath });
     data = await res.json();
   } catch(e) {
     _moveInProgress = false;
@@ -4951,6 +4940,124 @@ function dismissCacheToast() {
   setInterval(_pollStatus, 4000);
 })();
 
+// ── Offline queue: manual sort actions (move / rename / move-folder) ───────
+// If the connection drops mid-session (Tailscale hiccup, client's internet
+// blipping, their machine's CPU pegged), rather than every click just
+// silently failing, queue the action locally, apply it optimistically to
+// the UI, and replay the real requests once connectivity is confirmed
+// back — with a confirmation prompt listing exactly what will be applied,
+// since these are real files on the client's disk, not database rows that
+// can be blindly replayed.
+let _offlineQueue = [];
+try { _offlineQueue = JSON.parse(localStorage.getItem('wlm-offline-queue') || '[]'); } catch(e) {}
+// If the page was closed/refreshed before a previous offline session ever
+// reconciled, treat this load as still "offline" so the first successful
+// stats poll naturally triggers the reconnect prompt for the leftover queue.
+let _isOffline = _offlineQueue.length > 0;
+if (_isOffline) document.addEventListener('DOMContentLoaded', () => _updateOfflineBanner());
+
+function _saveOfflineQueue() {
+  try { localStorage.setItem('wlm-offline-queue', JSON.stringify(_offlineQueue)); } catch(e) {}
+}
+
+function _describeOfflineAction(action) {
+  if (action.kind === 'move') {
+    const n = (action.body.paths || []).length;
+    return `${n} file${n !== 1 ? 's' : ''} moved to "${(action.body.to || '').split('/').pop() || action.body.to}"`;
+  }
+  if (action.kind === 'rename') {
+    return `"${(action.body.path || '').split('/').pop()}" renamed to "${action.body.name}"`;
+  }
+  if (action.kind === 'move-folder') {
+    return `Folder "${(action.body.src || '').split('/').pop()}" moved into "${(action.body.dest || '').split('/').pop() || 'top level'}"`;
+  }
+  return 'Unknown change';
+}
+
+function _updateOfflineBanner() {
+  const el = $('offlineBanner');
+  if (!el) return;
+  if (_isOffline) {
+    const n = _offlineQueue.length;
+    el.textContent = `⚠ Offline — working locally${n ? ` (${n} change${n !== 1 ? 's' : ''} will apply when reconnected)` : ''}`;
+    el.style.display = 'block';
+  } else {
+    el.style.display = 'none';
+  }
+}
+
+function _setOffline(val) {
+  if (val === _isOffline) return;
+  _isOffline = val;
+  _updateOfflineBanner();
+  if (!val && _offlineQueue.length) _showReconnectPrompt();
+}
+
+function _showReconnectPrompt() {
+  const lines = _offlineQueue.map(a => '• ' + _describeOfflineAction(a)).join('\n');
+  const proceed = confirm(
+    `Connection restored. Apply the following ${_offlineQueue.length} change${_offlineQueue.length !== 1 ? 's' : ''} made while offline?\n\n${lines}`
+  );
+  if (!proceed) {
+    _offlineQueue = [];
+    _saveOfflineQueue();
+    _updateOfflineBanner();
+    $('statusLeft').textContent = 'Offline changes discarded — refresh to see the current folder state.';
+    return;
+  }
+  _replayOfflineQueue();
+}
+
+async function _replayOfflineQueue() {
+  const queue = _offlineQueue;
+  _offlineQueue = [];
+  _saveOfflineQueue();
+  let ok = 0, failed = 0;
+  for (const action of queue) {
+    try {
+      const res = await fetch(action.url, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(action.body),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (res.ok && !data.error && data.ok !== false) ok++; else failed++;
+    } catch (e) { failed++; }
+  }
+  _updateOfflineBanner();
+  $('statusLeft').textContent = `Applied ${ok} offline change${ok !== 1 ? 's' : ''}` +
+    (failed ? `, ${failed} failed — refresh to check the current folder state` : ' — refreshing…');
+  if (typeof _refreshTreeAt === 'function') { try { await _refreshTreeAt(null); } catch(e) {} }
+}
+
+// Sends a sort action if online; queues it (and fakes a plausible success
+// response so the caller's existing .json()-handling code still updates the
+// UI, exactly as if the server had confirmed it) if offline.
+async function _sendOrQueue(kind, url, bodyObj) {
+  if (!_isOffline) {
+    try {
+      return await fetch(url, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(bodyObj),
+      });
+    } catch (e) {
+      _setOffline(true);  // fall through to queueing now that we know we're offline
+    }
+  }
+  _offlineQueue.push({ kind, url, body: bodyObj, ts: Date.now() });
+  _saveOfflineQueue();
+  _updateOfflineBanner();
+  const fake = { ok: true };
+  if (kind === 'move') fake.moved = bodyObj.paths;
+  if (kind === 'rename') {
+    fake.new_path = bodyObj.path.includes('/')
+      ? bodyObj.path.split('/').slice(0, -1).concat(bodyObj.name).join('/') : bodyObj.name;
+  }
+  if (kind === 'move-folder') {
+    fake.new_path = (bodyObj.dest ? bodyObj.dest + '/' : '') + bodyObj.src.split('/').pop();
+  }
+  return new Response(JSON.stringify(fake), { status: 200 });
+}
+
 // ── Live system stats (CPU / network) ───────────────────────────────────────
 // Real observed throughput, not a synthetic speed test — a continuous
 // bandwidth test would itself compete with real sorting/thumbnail traffic
@@ -4964,12 +5071,16 @@ function dismissCacheToast() {
   async function _pollSystemStats() {
     try {
       const r = await fetch('/api/system-stats');
+      if (!r.ok) throw new Error('bad status');
       const d = await r.json();
+      _setOffline(false);
       const cachePrefix = d.generating_cache ? 'Generating cache…  ·  ' : '';
       $('statusRight').innerHTML =
         `${cachePrefix}<span style="color:${_cpuColor(d.cpu_percent)}">CPU ${Math.round(d.cpu_percent)}%</span>` +
         `  ·  ↑ ${d.upload_mbps.toFixed(1)}  ↓ ${d.download_mbps.toFixed(1)} Mbps`;
-    } catch(e) {}
+    } catch(e) {
+      _setOffline(true);
+    }
   }
   _pollSystemStats();
   setInterval(_pollSystemStats, 3000);
