@@ -13,9 +13,41 @@ interpreter or app.py file on disk to subprocess out to.
 import atexit
 import os
 import signal
+import sys
 import threading
 import tkinter as tk
 from pathlib import Path
+
+
+def _resource_dir() -> Path:
+    """Where bundled ffmpeg/exiftool live: next to this script in dev, or
+    inside PyInstaller's extracted bundle dir once packaged. sys._MEIPASS is
+    PyInstaller's own answer to "where did my datas/binaries actually land" —
+    on macOS .app bundles that's Contents/Resources, not next to the
+    executable in Contents/MacOS, so don't derive this from sys.executable."""
+    if getattr(sys, 'frozen', False):
+        return Path(sys._MEIPASS) / 'resources'
+    return Path(__file__).resolve().parent / 'resources'
+
+
+def _setup_bundled_tools():
+    """Put our bundled ffmpeg/exiftool ahead of PATH so app.py's bare
+    'ffmpeg'/'exiftool' subprocess calls find them without the client needing
+    either installed. exiftool is a Perl script with Homebrew's absolute
+    Cellar path hardcoded into its own `unshift @INC` lines; those entries
+    just won't exist on a client machine and get silently skipped, so we
+    supply the real module path via PERL5LIB instead of relying on them."""
+    res = _resource_dir()
+    exiftool_dir = res / 'exiftool'
+    lib_dir = exiftool_dir / 'lib' / 'perl5'
+    if not res.is_dir():
+        return  # dev machine without resources/ set up yet — falls back to system PATH
+    os.environ['PATH'] = f"{res}{os.pathsep}{exiftool_dir}{os.pathsep}{os.environ.get('PATH', '')}"
+    existing_perl5lib = os.environ.get('PERL5LIB', '')
+    os.environ['PERL5LIB'] = f"{lib_dir}{os.pathsep}{existing_perl5lib}" if existing_perl5lib else str(lib_dir)
+
+
+_setup_bundled_tools()
 
 # Must be set before `app` is imported — PHOTOS_DIR is read at module load
 # time. Bare-metal (non-Docker) runs need a real default; Docker deploys set
@@ -23,7 +55,7 @@ from pathlib import Path
 # plain double-clicked client build.
 os.environ.setdefault('PHOTOS_DIR', str(Path.home()))
 
-import app as server_app  # noqa: E402  (must follow the PHOTOS_DIR default above)
+import app as server_app  # noqa: E402  (must follow the setup above)
 
 STATUS_STARTING = "Starting sorting service..."
 STATUS_WAITING_TAILSCALE = "Waiting for Tailscale connection...\n(make sure you're signed in to Tailscale)"
