@@ -288,7 +288,7 @@ class ServiceShell:
 
     def _begin_serving(self, folder):
         self._clear()
-        self.root.geometry("360x320")
+        self.root.geometry("360x350")
 
         logo = self._logo_image(180)
         if logo:
@@ -324,6 +324,11 @@ class ServiceShell:
         _make_button(
             self.root, "Delete cache...", self._on_delete_cache,
             bg=_COL_BG, fg=_COL_FG_DIM, font_size=10,
+        ).pack(pady=(0, 2))
+
+        _make_button(
+            self.root, "Restart service...", self._on_restart_service,
+            bg=_COL_BG, fg=_COL_FG_DIM, font_size=10,
         ).pack(pady=(0, 4))
 
         tk.Label(
@@ -338,6 +343,22 @@ class ServiceShell:
         folder = filedialog.askdirectory(title="Choose a folder for White Lights Media")
         if folder:
             _save_config({'photos_dir': folder})
+            self._stopped = True
+            _restart_app()
+
+    def _on_restart_service(self):
+        """Re-detects the Tailscale IP and rebinds from scratch. Our server
+        only checks the Tailscale IP once at startup and binds to it for
+        good — if that IP ever changes underneath it (network switch,
+        Tailscale hiccup), status would stay stuck without this. Doesn't
+        touch Tailscale itself, just our own connection to it."""
+        proceed = messagebox.askyesno(
+            "Restart sorting service?",
+            "This briefly disconnects White Lights Media while the service "
+            "restarts. Use this if the status has been stuck on \"Not "
+            "connected\" for a while.\n\nRestart now?",
+        )
+        if proceed:
             self._stopped = True
             _restart_app()
 
