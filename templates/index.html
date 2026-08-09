@@ -4958,12 +4958,17 @@ function dismissCacheToast() {
 // answers "is something moving slowly right now", which is the actual
 // question, for free.
 (function() {
+  function _cpuColor(pct) {
+    return pct >= 85 ? '#e74c3c' : pct >= 60 ? '#e6b800' : 'inherit';
+  }
   async function _pollSystemStats() {
     try {
       const r = await fetch('/api/system-stats');
       const d = await r.json();
-      $('statusRight').textContent =
-        `CPU ${Math.round(d.cpu_percent)}%  ·  ↑ ${d.upload_mbps.toFixed(1)}  ↓ ${d.download_mbps.toFixed(1)} Mbps`;
+      const cachePrefix = d.generating_cache ? 'Generating cache…  ·  ' : '';
+      $('statusRight').innerHTML =
+        `${cachePrefix}<span style="color:${_cpuColor(d.cpu_percent)}">CPU ${Math.round(d.cpu_percent)}%</span>` +
+        `  ·  ↑ ${d.upload_mbps.toFixed(1)}  ↓ ${d.download_mbps.toFixed(1)} Mbps`;
     } catch(e) {}
   }
   _pollSystemStats();

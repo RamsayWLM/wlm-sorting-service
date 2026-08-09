@@ -1669,10 +1669,13 @@ def _get_system_stats() -> dict:
         _net_io_last = {'ts': now, 'bytes_sent': io_now.bytes_sent, 'bytes_recv': io_now.bytes_recv}
     except Exception:
         pass
+    with _jobs_mu:
+        generating_cache = any(not j.get('finished', True) for j in _jobs.values())
     return {
         'cpu_percent': cpu_percent,
         'upload_mbps': max(upload_mbps, 0.0),
         'download_mbps': max(download_mbps, 0.0),
+        'generating_cache': generating_cache,
     }
 
 

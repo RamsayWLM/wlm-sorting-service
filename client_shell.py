@@ -392,7 +392,7 @@ class ServiceShell:
         ).pack(pady=(0, 6))
 
         self.stats_var = tk.StringVar(value="")
-        tk.Label(
+        self.stats_label = tk.Label(
             self.root, textvariable=self.stats_var, fg=_COL_FG_DIM, bg=_COL_BG,
             font=("-apple-system", 10),
         ).pack(pady=(0, 10))
@@ -429,10 +429,13 @@ class ServiceShell:
     def _update_stats(self):
         try:
             stats = server_app._get_system_stats()
+            cpu = stats['cpu_percent']
+            prefix = "Generating cache…  ·  " if stats.get('generating_cache') else ""
             self.stats_var.set(
-                f"CPU {stats['cpu_percent']:.0f}%  ·  "
+                f"{prefix}CPU {cpu:.0f}%  ·  "
                 f"↑ {stats['upload_mbps']:.1f}  ↓ {stats['download_mbps']:.1f} Mbps"
             )
+            self.stats_label.configure(fg=_COL_RED if cpu >= 85 else _COL_YELLOW if cpu >= 60 else _COL_FG_DIM)
         except Exception:
             pass
         if not self._stopped:
