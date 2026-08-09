@@ -983,12 +983,61 @@ let _ghost        = null;
 let _zoomPx       = 250;
 let _hoveredFolder = null;
 
+// ── Offline snapshot storage (IndexedDB) ────────────────────────────────────
+// Service Workers + Cache Storage would be the cleaner way to do this, but
+// they require a secure context (HTTPS) — this app is served over plain
+// HTTP via a Tailscale IP, so that API isn't available at all here.
+// IndexedDB has no such restriction, so deliberate offline storage is done
+// manually instead: explicit stores/fetches here, and an explicit fallback
+// check in api() and image-loading, rather than a transparent network-layer
+// intercept.
+const OFFLINE_DB_NAME = 'wlm-offline-db';
+const OFFLINE_DB_VERSION = 1;
+let _offlineDbPromise = null;
+
+function _openOfflineDb() {
+  if (_offlineDbPromise) return _offlineDbPromise;
+  _offlineDbPromise = new Promise((resolve, reject) => {
+    const req = indexedDB.open(OFFLINE_DB_NAME, OFFLINE_DB_VERSION);
+    req.onupgradeneeded = () => {
+      const db = req.result;
+      if (!db.objectStoreNames.contains('thumbs')) db.createObjectStore('thumbs');
+      if (!db.objectStoreNames.contains('listings')) db.createObjectStore('listings');
+    };
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+  return _offlineDbPromise;
+}
+
+async function _idbPut(storeName, key, value) {
+  const db = await _openOfflineDb();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(storeName, 'readwrite');
+    tx.objectStore(storeName).put(value, key);
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
+}
+
+async function _idbGet(storeName, key) {
+  const db = await _openOfflineDb();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(storeName, 'readonly');
+    const req = tx.objectStore(storeName).get(key);
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+
 async function api(url) {
   let r;
   try {
     r = await _fetchWithTimeout(url, {}, 6000);
   } catch (e) {
     _setOffline(true);
+    const cached = await _idbGet('listings', url).catch(() => undefined);
+    if (cached !== undefined) return cached;
     throw e;
   }
   if (!r.ok) throw new Error(r.status);
@@ -2424,7 +2473,7 @@ function _initImgLoading(container) {
       _markLoaded();
     } else {
       img.addEventListener('load',  _markLoaded, {once: true});
-      img.addEventListener('error', () => {
+      img.addEventListener('error', async () => {
         img._retries = (img._retries || 0) + 1;
         if (img._retries <= 2) {
           const s = img.src; img.src = '';
@@ -2433,9 +2482,21 @@ function _initImgLoading(container) {
             img.src = s;
             _initImgLoading(img.parentElement || container);
           }, 700 * img._retries);
-        } else {
-          img.classList.add('loaded');
+          return;
         }
+        // Live load failed after retries (likely offline) -- fall back to a
+        // deliberately-stored offline copy if this file was ever prepared
+        // for offline. Rebuilt from data-path rather than img.src, since a
+        // retry above may have rewritten src to a resolved absolute URL
+        // that won't match the relative key it was stored under.
+        const p = img.closest('.grid-cell')?.dataset.path || img.closest('.video-row')?.dataset.path;
+        if (p && window.indexedDB) {
+          try {
+            const blob = await _idbGet('thumbs', `/thumb/${encPath(p)}`);
+            if (blob) { img.src = URL.createObjectURL(blob); return; }
+          } catch (e) {}
+        }
+        img.classList.add('loaded');
       }, {once: true});
     }
   });
@@ -5156,44 +5217,103 @@ async function _sendOrQueue(kind, url, bodyObj) {
 
 // ── Browser cache prefetch ─────────────────────────────────────────────────────
 
+// ── Offline snapshot: deliberate IndexedDB storage ──────────────────────────
+// The previous version of this relied on the browser's own opportunistic
+// HTTP cache (`fetch(url, {cache:'force-cache'})`) — not something we
+// control, and silently bypassed by things like a hard refresh (which
+// forces revalidation and fails outright when there's no network, rather
+// than falling back to the stale-but-present copy). This snapshots into
+// IndexedDB instead (see _idbPut/_idbGet above) — api() and image loading
+// both explicitly check it when a live request fails.
+const OFFLINE_FETCH_CONCURRENCY = 6;
+
+// Walks the folder tree from `root` down, storing every level's /api/ls
+// response as it goes (so offline sidebar navigation works, not just the
+// thumbnails) and returns every folder path discovered along the way.
+async function _enumerateAndStoreFolders(root) {
+  const all = [];
+  const seen = new Set([root]);
+  const queue = [root];
+  while (queue.length) {
+    const folder = queue.shift();
+    all.push(folder);
+    const url = `/api/ls/${encPath(folder)}`;
+    try {
+      const resp = await fetch(url);
+      if (resp.ok) {
+        const children = await resp.json();
+        await _idbPut('listings', url, children);
+        for (const c of children) {
+          const childPath = folder ? `${folder}/${c.name}` : c.name;
+          if (!seen.has(childPath)) { seen.add(childPath); queue.push(childPath); }
+        }
+      }
+    } catch (e) {}
+  }
+  return all;
+}
+
 async function prefetchFolderThumbs(folder, expectedTotal) {
+  if (!window.indexedDB) return;
+  const sidebarText = $('cacheStatusText');
+  const sidebarWrap = $('cacheProgressWrap');
+  const sidebarBar  = $('cacheProgressBar');
+  const name = folder.split('/').pop();
   try {
-    const resp = await api(`/api/photos-in/${encPath(folder)}`);
-    const items = Array.isArray(resp) ? resp : resp.items;
-    const total = items.length;
-    if (!total) return;
+    if (sidebarText) { sidebarText.textContent = `Preparing "${name}" for offline…`; sidebarText.style.color = 'var(--gold)'; }
+    if (sidebarWrap) sidebarWrap.style.display = '';
+
+    // /api/photos-in is already recursive server-side, but each stored
+    // listing is matched by its own exact URL — a subfolder browsed offline
+    // needs its OWN stored response, even though its files are also present
+    // in a parent's. Only the (cheap, text) listing is duplicated this way;
+    // thumbnail bytes are still deduped via the unique-paths set below.
+    const folders = await _enumerateAndStoreFolders(folder);
+    const allFiles = [];
+    for (const f of folders) {
+      const url = `/api/photos-in/${encPath(f)}`;
+      try {
+        const resp = await fetch(url);
+        if (resp.ok) {
+          const data = await resp.json();
+          await _idbPut('listings', url, data);
+          const items = Array.isArray(data) ? data : data.items;
+          allFiles.push(...(items || []));
+        }
+      } catch (e) {}
+    }
+
+    const uniquePaths = [...new Set(allFiles.map(m => m.path))];
+    const total = uniquePaths.length;
+    if (!total) { if (sidebarWrap) sidebarWrap.style.display = 'none'; return; }
 
     let done = 0;
-    const jobs = items.map(m => ({ url: `/thumb/${encPath(m.path)}`, path: m.path }));
-    const CONCURRENCY = 6;
-
-    const sidebarText = $('cacheStatusText');
-    const sidebarWrap = $('cacheProgressWrap');
-    const sidebarBar  = $('cacheProgressBar');
-    const name = folder.split('/').pop();
+    const jobs = uniquePaths.map(p => ({ url: `/thumb/${encPath(p)}`, path: p }));
 
     const updateSidebar = () => {
       const pct = Math.round(done / total * 100);
-      if (sidebarText) { sidebarText.textContent = done < total ? `Browser cache: ${name} — ${done}/${total} (${pct}%)` : `Browser cache ready — ${total} thumbnails`; sidebarText.style.color = 'var(--gold)'; }
+      if (sidebarText) sidebarText.textContent = done < total ? `Offline-ready: ${name} — ${done}/${total} (${pct}%)` : `Offline-ready — ${total} thumbnails`;
       if (sidebarWrap) { sidebarWrap.style.display = done < total ? '' : 'none'; if (sidebarBar) sidebarBar.style.width = pct + '%'; }
     };
-
     updateSidebar();
 
     const worker = async () => {
       while (jobs.length) {
         const job = jobs.shift();
         try {
-          await fetch(job.url, { cache: 'force-cache' });
+          const resp = await fetch(job.url);
+          if (resp.ok) {
+            const blob = await resp.blob();
+            await _idbPut('thumbs', job.url, blob);
+          }
           _markBrowserCached(job.path);
-        } catch(e) {}
+        } catch (e) {}
         done++;
         if (done % 10 === 0 || done === total) updateSidebar();
       }
     };
-
-    await Promise.all(Array.from({ length: CONCURRENCY }, worker));
-  } catch(e) {}
+    await Promise.all(Array.from({ length: Math.min(OFFLINE_FETCH_CONCURRENCY, total) }, worker));
+  } catch (e) {}
 }
 
 // ── Download selected ──────────────────────────────────────────────────────────
