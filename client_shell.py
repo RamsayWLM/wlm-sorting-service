@@ -9,14 +9,25 @@ Tailscale with the shared password, does.
 Runs Flask in-thread rather than as a subprocess so this can be frozen into
 a single PyInstaller executable: a frozen binary has no separate `python`
 interpreter or app.py file on disk to subprocess out to.
+
+First launch shows a setup screen (Tailscale steps + a folder picker) before
+ever touching the filesystem. `app.py` is only imported once a folder is
+chosen, because PHOTOS_DIR must be set before that import — importing it
+against the client's entire home directory would make macOS's privacy
+prompts fire once per protected category (Desktop, Documents, Downloads,
+iCloud Drive, ...) the moment it's scanned, instead of once for the one
+folder the client actually agreed to.
 """
 import atexit
+import json
 import os
 import signal
 import sys
 import threading
 import tkinter as tk
+import webbrowser
 from pathlib import Path
+from tkinter import filedialog
 
 
 def _resource_dir() -> Path:
@@ -49,45 +60,80 @@ def _setup_bundled_tools():
 
 _setup_bundled_tools()
 
-# Must be set before `app` is imported — PHOTOS_DIR is read at module load
-# time. Bare-metal (non-Docker) runs need a real default; Docker deploys set
-# PHOTOS_DIR themselves via docker-compose, so this only fills the gap for a
-# plain double-clicked client build.
-os.environ.setdefault('PHOTOS_DIR', str(Path.home()))
+# macOS's AirPlay Receiver listens on 5000 (and sometimes 7000) by default on
+# most Macs out of the box — Flask's own default port would collide with it
+# on a fresh client machine. Docker deploys set PORT themselves via compose,
+# so this only fills the gap for a plain double-clicked client build.
+os.environ.setdefault('PORT', '58620')
 
-import app as server_app  # noqa: E402  (must follow the setup above)
+CONFIG_DIR = Path.home() / 'Library' / 'Application Support' / 'WLM Sorting Service'
+CONFIG_FILE = CONFIG_DIR / 'config.json'
+
+WLM_TAILSCALE_SHARE_EMAIL = "whitelightsmediauk@gmail.com"
+
+SETUP_STEPS_TEXT = (
+    "1. Download and install Tailscale (button below).\n\n"
+    "2. Open Tailscale and sign in — any Google, Microsoft, or email account "
+    "works. This creates your own free Tailscale account, completely "
+    "separate from White Lights Media's.\n\n"
+    "3. Click the Tailscale icon in your menu bar, choose \"Share...\", "
+    "select this computer, and share it with:\n"
+    f"        {WLM_TAILSCALE_SHARE_EMAIL}\n\n"
+    "4. Choose the folder below for White Lights Media to work in, then "
+    "click Done."
+)
 
 STATUS_STARTING = "Starting sorting service..."
 STATUS_WAITING_TAILSCALE = "Waiting for Tailscale connection...\n(make sure you're signed in to Tailscale)"
 STATUS_READY = "Sorting service ready\nWaiting for connection"
 STATUS_CRASHED = "Sorting service stopped unexpectedly\nPlease contact White Lights Media"
 
+_COL_BG = "#181818"
+_COL_FG = "#e0e0e0"
+_COL_FG_DIM = "#707070"
+_COL_ACCENT = "#d4a017"
+_COL_BTN = "#2a2a2a"
+
+
+def _load_config() -> dict:
+    try:
+        return json.loads(CONFIG_FILE.read_text())
+    except Exception:
+        return {}
+
+
+def _save_config(cfg: dict):
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    CONFIG_FILE.write_text(json.dumps(cfg))
+
+
+def _restart_app():
+    """Full process restart so app.py (and its module-level BASE) picks up
+    a newly-chosen PHOTOS_DIR. Once `app` is imported, BASE is fixed for the
+    life of the process — there's no clean way to re-point it in place."""
+    python = sys.executable
+    if getattr(sys, 'frozen', False):
+        os.execv(python, [python])
+    else:
+        os.execv(python, [python, os.path.abspath(__file__)])
+
+
+def _import_server_app(photos_dir: str):
+    os.environ['PHOTOS_DIR'] = photos_dir
+    global server_app
+    import app as server_app
+
 
 class ServiceShell:
     def __init__(self):
         self.root = tk.Tk()
         self.root.title("WLM Sorting Service")
-        self.root.geometry("360x180")
         self.root.resizable(False, False)
-        self.root.configure(bg="#181818")
+        self.root.configure(bg=_COL_BG)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
-        dot = tk.Canvas(self.root, width=16, height=16, bg="#181818", highlightthickness=0)
-        dot.create_oval(2, 2, 14, 14, fill="#d4a017", outline="")
-        dot.pack(pady=(28, 10))
-
-        self.status_var = tk.StringVar(value=STATUS_STARTING)
-        tk.Label(
-            self.root, textvariable=self.status_var, fg="#e0e0e0", bg="#181818",
-            font=("-apple-system", 13), wraplength=320, justify="center",
-        ).pack(pady=4, expand=True)
-
-        tk.Label(
-            self.root, text="White Lights Media", fg="#707070", bg="#181818",
-            font=("-apple-system", 10),
-        ).pack(side="bottom", pady=14)
-
         self._stopped = False
+        self._chosen_folder = tk.StringVar(value="No folder chosen yet")
 
         # WM_DELETE_WINDOW only fires on a clean window close. A force-quit
         # or `kill` sends SIGTERM/SIGINT straight past Tkinter — harmless now
@@ -96,6 +142,120 @@ class ServiceShell:
         # than leaving Tkinter in a half-torn-down state.
         signal.signal(signal.SIGTERM, self._on_signal)
         signal.signal(signal.SIGINT, self._on_signal)
+
+        cfg = _load_config()
+        folder = cfg.get('photos_dir')
+        if folder and Path(folder).is_dir():
+            self._begin_serving(folder)
+        else:
+            self._build_setup_screen()
+
+    def _clear(self):
+        for w in self.root.winfo_children():
+            w.destroy()
+
+    # ── First-run setup screen ──────────────────────────────────────────
+
+    def _build_setup_screen(self):
+        self._clear()
+        self.root.geometry("440x560")
+        pad = {'padx': 24}
+
+        tk.Label(
+            self.root, text="Welcome to the WLM Sorting Service", fg=_COL_FG, bg=_COL_BG,
+            font=("-apple-system", 15, "bold"), wraplength=390, justify="left",
+        ).pack(pady=(24, 12), **pad)
+
+        tk.Label(
+            self.root, text=SETUP_STEPS_TEXT, fg="#b0b0b0", bg=_COL_BG,
+            font=("-apple-system", 12), wraplength=390, justify="left",
+        ).pack(pady=(0, 14), **pad)
+
+        tk.Button(
+            self.root, text="Open Tailscale download page",
+            command=lambda: webbrowser.open('https://tailscale.com/download'),
+            bg=_COL_BTN, fg=_COL_FG, relief="flat", padx=10, pady=6,
+        ).pack(pady=(0, 20), **pad)
+
+        tk.Frame(self.root, bg="#333", height=1).pack(fill='x', **pad)
+
+        tk.Label(
+            self.root, text="Choose the folder for White Lights Media to work in:",
+            fg=_COL_FG, bg=_COL_BG, font=("-apple-system", 12, "bold"),
+            wraplength=390, justify="left",
+        ).pack(pady=(20, 6), **pad)
+
+        tk.Label(
+            self.root, textvariable=self._chosen_folder, fg=_COL_ACCENT, bg=_COL_BG,
+            font=("-apple-system", 11), wraplength=390, justify="left",
+        ).pack(pady=(0, 6), **pad)
+
+        tk.Label(
+            self.root,
+            text="Tip: a folder outside Desktop/Documents/Downloads avoids extra permission prompts.",
+            fg=_COL_FG_DIM, bg=_COL_BG, font=("-apple-system", 10),
+            wraplength=390, justify="left",
+        ).pack(pady=(0, 12), **pad)
+
+        tk.Button(
+            self.root, text="Browse...", command=self._on_browse,
+            bg=_COL_BTN, fg=_COL_FG, relief="flat", padx=10, pady=6,
+        ).pack(pady=(0, 20), **pad)
+
+        self._done_btn = tk.Button(
+            self.root, text="Done", command=self._on_setup_done, state='disabled',
+            bg=_COL_ACCENT, fg=_COL_BG, font=("-apple-system", 12, "bold"),
+            relief="flat", padx=10, pady=8,
+        )
+        self._done_btn.pack(pady=(0, 24), **pad)
+
+    def _on_browse(self):
+        folder = filedialog.askdirectory(title="Choose a folder for White Lights Media")
+        if folder:
+            self._chosen_folder.set(folder)
+            self._done_btn.config(state='normal')
+
+    def _on_setup_done(self):
+        folder = self._chosen_folder.get()
+        _save_config({'photos_dir': folder})
+        self._begin_serving(folder)
+
+    # ── Running status screen ────────────────────────────────────────────
+
+    def _begin_serving(self, folder):
+        self._clear()
+        self.root.geometry("360x200")
+
+        dot = tk.Canvas(self.root, width=16, height=16, bg=_COL_BG, highlightthickness=0)
+        dot.create_oval(2, 2, 14, 14, fill=_COL_ACCENT, outline="")
+        dot.pack(pady=(24, 8))
+
+        self.status_var = tk.StringVar(value=STATUS_STARTING)
+        tk.Label(
+            self.root, textvariable=self.status_var, fg=_COL_FG, bg=_COL_BG,
+            font=("-apple-system", 13), wraplength=320, justify="center",
+        ).pack(pady=4, expand=True)
+
+        tk.Button(
+            self.root, text="Change folder...", command=self._on_change_folder,
+            bg=_COL_BG, fg=_COL_FG_DIM, relief="flat", font=("-apple-system", 10),
+            borderwidth=0, highlightthickness=0,
+        ).pack(pady=(0, 4))
+
+        tk.Label(
+            self.root, text="White Lights Media", fg=_COL_FG_DIM, bg=_COL_BG,
+            font=("-apple-system", 10),
+        ).pack(side="bottom", pady=14)
+
+        _import_server_app(folder)
+        threading.Thread(target=self._run_server, daemon=True).start()
+
+    def _on_change_folder(self):
+        folder = filedialog.askdirectory(title="Choose a folder for White Lights Media")
+        if folder:
+            _save_config({'photos_dir': folder})
+            self._stopped = True
+            _restart_app()
 
     def _set_status(self, text):
         self.root.after(0, lambda: self.status_var.set(text))
@@ -124,7 +284,6 @@ class ServiceShell:
         os._exit(0)  # Flask's dev server has no clean in-thread stop call; exiting the process is the only reliable way to take it down.
 
     def run(self):
-        threading.Thread(target=self._run_server, daemon=True).start()
         self.root.mainloop()
 
 
