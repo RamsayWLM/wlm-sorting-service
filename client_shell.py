@@ -103,6 +103,7 @@ _COL_ACCENT = "#d4a017"
 _COL_BTN = "#404040"
 _COL_BTN_FG = "#ffffff"
 _COL_BTN_DISABLED = "#2a2a2a"
+_COL_BTN_SUBTLE = "#262626"
 _COL_GREEN = "#2ecc71"
 _COL_YELLOW = "#e6b800"
 _COL_RED = "#e74c3c"
@@ -112,7 +113,7 @@ _COL_RED = "#e74c3c"
 STATUS_STATES = {
     'starting': {'text': "Starting sorting service...", 'color': _COL_FG_DIM},
     'waiting': {'text': "Not connected\n(waiting for Tailscale)", 'color': _COL_YELLOW},
-    'ready': {'text': "Sorting service ready\nWaiting for connection", 'color': _COL_GREEN},
+    'ready': {'text': "Connected\nReady for White Lights Media", 'color': _COL_GREEN},
     'crashed': {'text': "Sorting service stopped unexpectedly\nPlease contact White Lights Media", 'color': _COL_RED},
 }
 
@@ -362,7 +363,7 @@ class ServiceShell:
 
     def _begin_serving(self, folder):
         self._clear()
-        self.root.geometry("360x390")
+        self.root.geometry("360x410")
 
         logo = self._logo_image(180)
         if logo:
@@ -388,26 +389,32 @@ class ServiceShell:
         tk.Label(
             self.root, text=f"Working folder: {folder}", fg=_COL_FG_DIM, bg=_COL_BG,
             font=("-apple-system", 10), wraplength=320, justify="center",
+        ).pack(pady=(0, 6))
+
+        self.stats_var = tk.StringVar(value="")
+        tk.Label(
+            self.root, textvariable=self.stats_var, fg=_COL_FG_DIM, bg=_COL_BG,
+            font=("-apple-system", 10),
         ).pack(pady=(0, 10))
 
         _make_button(
             self.root, "Change folder...", self._on_change_folder,
-            bg=_COL_BG, fg=_COL_FG_DIM, font_size=10,
+            bg=_COL_BTN_SUBTLE, fg=_COL_FG_DIM, font_size=10,
         ).pack(pady=(0, 2))
 
         _make_button(
             self.root, "Delete cache...", self._on_delete_cache,
-            bg=_COL_BG, fg=_COL_FG_DIM, font_size=10,
+            bg=_COL_BTN_SUBTLE, fg=_COL_FG_DIM, font_size=10,
         ).pack(pady=(0, 2))
 
         _make_button(
             self.root, "Restart service...", self._on_restart_service,
-            bg=_COL_BG, fg=_COL_FG_DIM, font_size=10,
+            bg=_COL_BTN_SUBTLE, fg=_COL_FG_DIM, font_size=10,
         ).pack(pady=(0, 2))
 
         _make_button(
             self.root, "Copy diagnostics...", lambda: self._on_copy_diagnostics(folder),
-            bg=_COL_BG, fg=_COL_FG_DIM, font_size=10,
+            bg=_COL_BTN_SUBTLE, fg=_COL_FG_DIM, font_size=10,
         ).pack(pady=(0, 4))
 
         tk.Label(
@@ -417,6 +424,19 @@ class ServiceShell:
 
         _import_server_app(folder)
         threading.Thread(target=self._run_server, daemon=True).start()
+        self._update_stats()
+
+    def _update_stats(self):
+        try:
+            stats = server_app._get_system_stats()
+            self.stats_var.set(
+                f"CPU {stats['cpu_percent']:.0f}%  ·  "
+                f"↑ {stats['upload_mbps']:.1f}  ↓ {stats['download_mbps']:.1f} Mbps"
+            )
+        except Exception:
+            pass
+        if not self._stopped:
+            self.root.after(2000, self._update_stats)
 
     def _on_copy_diagnostics(self, folder):
         text = _gather_diagnostics(folder)

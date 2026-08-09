@@ -11,6 +11,8 @@ import threading
 import time
 import uuid
 import zipfile
+
+import psutil
 from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
 from io import BytesIO
@@ -1636,6 +1638,47 @@ def _wipe_all_cache() -> int:
 def api_cache_wipe_all():
     """Delete every cached thumbnail, including ones not tracked by the bulk-cache feature."""
     return jsonify({'deleted': _wipe_all_cache()})
+
+
+# ── Live system stats (CPU / network) ───────────────────────────────────────
+# Real observed throughput rather than a synthetic speed test: running an
+# actual bandwidth test continuously would itself compete with real sorting
+# traffic for bandwidth, and only ever answers "how fast could this go" at
+# the moment it ran. Reading the OS's actual byte counters is free, always
+# current, and answers the question that's actually being asked — "is
+# something moving slowly right now."
+psutil.cpu_percent(interval=None)  # first call always returns 0 — prime it at import time
+_net_io_last = {'ts': time.time(), 'bytes_sent': 0, 'bytes_recv': 0}
+try:
+    _io = psutil.net_io_counters()
+    _net_io_last = {'ts': time.time(), 'bytes_sent': _io.bytes_sent, 'bytes_recv': _io.bytes_recv}
+except Exception:
+    pass
+
+
+def _get_system_stats() -> dict:
+    global _net_io_last
+    cpu_percent = psutil.cpu_percent(interval=None)
+    upload_mbps = download_mbps = 0.0
+    try:
+        now = time.time()
+        io_now = psutil.net_io_counters()
+        dt = max(now - _net_io_last['ts'], 0.001)
+        upload_mbps = round((io_now.bytes_sent - _net_io_last['bytes_sent']) * 8 / dt / 1_000_000, 2)
+        download_mbps = round((io_now.bytes_recv - _net_io_last['bytes_recv']) * 8 / dt / 1_000_000, 2)
+        _net_io_last = {'ts': now, 'bytes_sent': io_now.bytes_sent, 'bytes_recv': io_now.bytes_recv}
+    except Exception:
+        pass
+    return {
+        'cpu_percent': cpu_percent,
+        'upload_mbps': max(upload_mbps, 0.0),
+        'download_mbps': max(download_mbps, 0.0),
+    }
+
+
+@app.route('/api/system-stats')
+def api_system_stats():
+    return jsonify(_get_system_stats())
 
 
 @app.route('/api/timestamps/<path:folder>')

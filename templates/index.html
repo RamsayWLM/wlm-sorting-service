@@ -4951,6 +4951,25 @@ function dismissCacheToast() {
   setInterval(_pollStatus, 4000);
 })();
 
+// ── Live system stats (CPU / network) ───────────────────────────────────────
+// Real observed throughput, not a synthetic speed test — a continuous
+// bandwidth test would itself compete with real sorting/thumbnail traffic
+// for bandwidth, and only ever answers "how fast could this go" once. This
+// answers "is something moving slowly right now", which is the actual
+// question, for free.
+(function() {
+  async function _pollSystemStats() {
+    try {
+      const r = await fetch('/api/system-stats');
+      const d = await r.json();
+      $('statusRight').textContent =
+        `CPU ${Math.round(d.cpu_percent)}%  ·  ↑ ${d.upload_mbps.toFixed(1)}  ↓ ${d.download_mbps.toFixed(1)} Mbps`;
+    } catch(e) {}
+  }
+  _pollSystemStats();
+  setInterval(_pollSystemStats, 3000);
+})();
+
 // ── Browser cache prefetch ─────────────────────────────────────────────────────
 
 async function prefetchFolderThumbs(folder, expectedTotal) {
