@@ -21,6 +21,7 @@ folder the client actually agreed to.
 import atexit
 import json
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -32,6 +33,8 @@ from pathlib import Path
 from tkinter import filedialog, messagebox
 
 from PIL import Image, ImageTk
+
+APP_VERSION = "1.0.0"
 
 
 def _bundle_dir() -> Path:
@@ -160,6 +163,67 @@ def _restart_app():
     os._exit(0)
 
 
+LAUNCH_AGENT_LABEL = "com.whitelightsmedia.wlmsortingservice"
+LAUNCH_AGENT_PLIST = Path.home() / 'Library' / 'LaunchAgents' / f'{LAUNCH_AGENT_LABEL}.plist'
+
+
+def _set_launch_at_login(enabled: bool):
+    """Best-effort — a client's Mac rebooting mid-competition (software
+    update, power blip) would otherwise silently take the service offline
+    until someone notices and manually relaunches it. Only meaningful for
+    the packaged .app; a no-op in dev mode since there's no fixed bundle
+    path to point a LaunchAgent at."""
+    try:
+        if not enabled:
+            if LAUNCH_AGENT_PLIST.exists():
+                subprocess.run(['launchctl', 'unload', str(LAUNCH_AGENT_PLIST)], capture_output=True)
+                LAUNCH_AGENT_PLIST.unlink()
+            return
+        if not getattr(sys, 'frozen', False):
+            return
+        app_bundle = Path(sys.executable).resolve().parents[2]
+        plist = f'''<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>{LAUNCH_AGENT_LABEL}</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/open</string>
+        <string>-g</string>
+        <string>-a</string>
+        <string>{app_bundle}</string>
+    </array>
+    <key>RunAtLoad</key><true/>
+</dict>
+</plist>
+'''
+        LAUNCH_AGENT_PLIST.parent.mkdir(parents=True, exist_ok=True)
+        LAUNCH_AGENT_PLIST.write_text(plist)
+        subprocess.run(['launchctl', 'load', str(LAUNCH_AGENT_PLIST)], capture_output=True)
+    except Exception:
+        pass  # non-critical — worst case, the client just has to relaunch manually after a reboot
+
+
+def _gather_diagnostics(folder: str) -> str:
+    try:
+        ts_bin = server_app._tailscale_binary()
+        result = subprocess.run([ts_bin, 'ip', '-4'], capture_output=True, text=True, timeout=5)
+        ts_ip = result.stdout.strip().splitlines()[0] if result.returncode == 0 and result.stdout.strip() else "not connected"
+    except Exception:
+        ts_ip = "tailscale not found"
+    return "\n".join([
+        "WLM Sorting Service diagnostics",
+        f"Version: {APP_VERSION}",
+        f"Time: {time.strftime('%Y-%m-%d %H:%M:%S')}",
+        f"Working folder: {folder}",
+        f"Tailscale IP: {ts_ip}",
+        f"ffmpeg found: {bool(shutil.which('ffmpeg'))}",
+        f"exiftool found: {bool(shutil.which('exiftool'))}",
+        f"Cache folder: {os.environ.get('THUMB_DIR', 'n/a')}",
+    ])
+
+
 def _import_server_app(photos_dir: str):
     os.environ['PHOTOS_DIR'] = photos_dir
     # On the NAS deploy, THUMB_DIR (default /tmp/wlm_thumbs) is deliberately
@@ -184,6 +248,7 @@ class ServiceShell:
 
         self._stopped = False
         self._chosen_folder = tk.StringVar(value="No folder chosen yet")
+        self._launch_at_login_var = tk.BooleanVar(value=True)
 
         # WM_DELETE_WINDOW only fires on a clean window close. A force-quit
         # or `kill` sends SIGTERM/SIGINT straight past Tkinter — harmless now
@@ -225,7 +290,7 @@ class ServiceShell:
 
     def _build_setup_screen(self):
         self._clear()
-        self.root.geometry("440x540")
+        self.root.geometry("440x580")
         pad = {'padx': 24}
 
         logo = self._logo_image(240)
@@ -263,7 +328,15 @@ class ServiceShell:
 
         _make_button(
             self.root, "Browse...", self._on_browse, bg=_COL_BTN, fg=_COL_BTN_FG,
-        ).pack(pady=(0, 20), **pad)
+        ).pack(pady=(0, 16), **pad)
+
+        tk.Checkbutton(
+            self.root, text="Launch automatically when this Mac starts (recommended)",
+            variable=self._launch_at_login_var, fg=_COL_FG, bg=_COL_BG,
+            selectcolor=_COL_BTN, activebackground=_COL_BG, activeforeground=_COL_FG,
+            font=("-apple-system", 11), wraplength=390, justify="left",
+            highlightthickness=0, bd=0,
+        ).pack(pady=(0, 16), **pad)
 
         self._done_btn = _make_button(
             self.root, "Done", self._on_setup_done, bg=_COL_BTN_DISABLED, fg=_COL_FG_DIM, bold=True,
@@ -282,13 +355,14 @@ class ServiceShell:
     def _on_setup_done(self):
         folder = self._chosen_folder.get()
         _save_config({'photos_dir': folder})
+        _set_launch_at_login(self._launch_at_login_var.get())
         self._begin_serving(folder)
 
     # ── Running status screen ────────────────────────────────────────────
 
     def _begin_serving(self, folder):
         self._clear()
-        self.root.geometry("360x350")
+        self.root.geometry("360x390")
 
         logo = self._logo_image(180)
         if logo:
@@ -329,15 +403,26 @@ class ServiceShell:
         _make_button(
             self.root, "Restart service...", self._on_restart_service,
             bg=_COL_BG, fg=_COL_FG_DIM, font_size=10,
+        ).pack(pady=(0, 2))
+
+        _make_button(
+            self.root, "Copy diagnostics...", lambda: self._on_copy_diagnostics(folder),
+            bg=_COL_BG, fg=_COL_FG_DIM, font_size=10,
         ).pack(pady=(0, 4))
 
         tk.Label(
-            self.root, text="White Lights Media", fg=_COL_FG_DIM, bg=_COL_BG,
+            self.root, text=f"White Lights Media · v{APP_VERSION}", fg=_COL_FG_DIM, bg=_COL_BG,
             font=("-apple-system", 10),
         ).pack(side="bottom", pady=14)
 
         _import_server_app(folder)
         threading.Thread(target=self._run_server, daemon=True).start()
+
+    def _on_copy_diagnostics(self, folder):
+        text = _gather_diagnostics(folder)
+        self.root.clipboard_clear()
+        self.root.clipboard_append(text)
+        messagebox.showinfo("Copied", "Diagnostic info copied — paste it into an email to White Lights Media.")
 
     def _on_change_folder(self):
         folder = filedialog.askdirectory(title="Choose a folder for White Lights Media")

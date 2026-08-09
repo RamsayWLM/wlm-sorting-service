@@ -798,7 +798,7 @@
 <div id="ctxMenu">
   <button id="ctxCache">&#9654; Cache thumbnails</button>
   <button id="ctxPin">&#128204; Pin to top</button>
-  <button id="ctxRevealFolder">&#128193; Reveal in Finder</button>
+  <button id="ctxRevealFolder" style="display:none">&#128193; Reveal in Finder</button>
   <button id="ctxCreateFolder">&#128193; Create new folder(s)</button>
   <div style="height:1px;background:#333;margin:3px 0"></div>
   <button id="ctxAiSortRef">Use as AI athlete folders</button>
@@ -922,7 +922,7 @@
   <button id="photoCtxDownload" style="display:block;width:100%;text-align:left;padding:6px 12px;background:none;border:none;color:#e8e8e8;cursor:pointer;font-size:13px;border-radius:4px" onmouseenter="this.style.background='#333'" onmouseleave="this.style.background='none'">&#8595; Download selected</button>
   <button id="photoCtxCopy" style="display:block;width:100%;text-align:left;padding:6px 12px;background:none;border:none;color:#e8e8e8;cursor:pointer;font-size:13px;border-radius:4px" onmouseenter="this.style.background='#333'" onmouseleave="this.style.background='none'">&#128203; Copy selected</button>
   <button id="photoCtxInfo" style="display:block;width:100%;text-align:left;padding:6px 12px;background:none;border:none;color:#e8e8e8;cursor:pointer;font-size:13px;border-radius:4px" onmouseenter="this.style.background='#333'" onmouseleave="this.style.background='none'">&#9432; File info</button>
-  <button id="photoCtxLightroom" style="display:block;width:100%;text-align:left;padding:6px 12px;background:none;border:none;color:#e8e8e8;cursor:pointer;font-size:13px;border-radius:4px" onmouseenter="this.style.background='#333'" onmouseleave="this.style.background='none'">&#127777; Open in Lightroom</button>
+  <button id="photoCtxLightroom" style="display:none;width:100%;text-align:left;padding:6px 12px;background:none;border:none;color:#e8e8e8;cursor:pointer;font-size:13px;border-radius:4px" onmouseenter="this.style.background='#333'" onmouseleave="this.style.background='none'">&#127777; Open in Lightroom</button>
   <button id="photoCtxReveal" style="display:block;width:100%;text-align:left;padding:6px 12px;background:none;border:none;color:#e8e8e8;cursor:pointer;font-size:13px;border-radius:4px" onmouseenter="this.style.background='#333'" onmouseleave="this.style.background='none'">&#128193; Copy path (Finder)</button>
   <div style="height:1px;background:#333;margin:3px 0"></div>
   <button id="photoCtxDelete" style="display:block;width:100%;text-align:left;padding:6px 12px;background:none;border:none;color:#e06060;cursor:pointer;font-size:13px;border-radius:4px" onmouseenter="this.style.background='#333'" onmouseleave="this.style.background='none'">&#128465; Delete selected</button>
@@ -1311,7 +1311,7 @@ function _populateLocationSelect() {
   if (!sel) return;
   const opts = ['', ..._EXTRA_LOCATIONS];
   sel.innerHTML = opts.map(loc =>
-    `<option value="${loc.replace(/"/g, '&quot;')}"${loc === _currentLocation ? ' selected' : ''}>📍 ${loc || 'Public'}</option>`
+    `<option value="${loc.replace(/"/g, '&quot;')}"${loc === _currentLocation ? ' selected' : ''}>📍 ${loc || 'All'}</option>`
   ).join('');
 }
 
@@ -4023,10 +4023,12 @@ $('gridWrap').addEventListener('contextmenu', e => {
   $('photoCtxDownload').textContent = `↓ Download selected (${n || 1})`;
   $('photoCtxCopy').textContent = `📋 Copy selected (${n || 1})`;
   $('photoCtxInfo').style.display = (_photoCtxIdx >= 0 && n <= 1) ? 'block' : 'none';
-  $('photoCtxReveal').style.display = _photoCtxIdx >= 0 ? 'block' : 'none';
-  const selItems = n > 0 ? [...selected].map(i => filtered[i]) : (_photoCtxIdx >= 0 ? [filtered[_photoCtxIdx]] : []);
-  const hasVideo = selItems.some(m => m?.type === 'video');
-  $('photoCtxLightroom').style.display = hasVideo ? 'none' : 'block';
+  // "Copy path (Finder)" and "Open in Lightroom" both assume WLM's team has
+  // this same folder mounted locally via the NAS's SMB share — not true when
+  // remotely sorting a client's own machine over Tailscale, so always hidden
+  // here regardless of selection.
+  $('photoCtxReveal').style.display = 'none';
+  $('photoCtxLightroom').style.display = 'none';
   const m = $('photoCtxMenu');
   m.style.display = 'block';
   const mw = m.offsetWidth || 180, mh = m.offsetHeight || 90;
@@ -5110,9 +5112,9 @@ async function openCacheManager() {
 
       <div style="display:flex;gap:10px;margin-bottom:16px">
         <div style="flex:1;min-width:0">
-          <div style="font-size:10px;color:#888;margin-bottom:4px">NAS thumbnail cache</div>
+          <div style="font-size:10px;color:#888;margin-bottom:4px">Thumbnail cache</div>
           <div id="_nasCacheStat" style="font-family:monospace;font-size:11px;background:#111;padding:8px;border-radius:5px;margin-bottom:6px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">loading…</div>
-          <button id="_nasWipeBtn" style="width:100%;padding:6px;background:rgba(200,50,50,0.1);border:1px solid rgba(200,50,50,0.25);color:#b05050;border-radius:5px;cursor:pointer;font-size:11px">🗑 Delete NAS cache now</button>
+          <button id="_nasWipeBtn" style="width:100%;padding:6px;background:rgba(200,50,50,0.1);border:1px solid rgba(200,50,50,0.25);color:#b05050;border-radius:5px;cursor:pointer;font-size:11px">🗑 Delete cache now</button>
         </div>
         <div style="flex:1;min-width:0">
           <div style="font-size:10px;color:#888;margin-bottom:4px">Browser cache (this device)</div>
@@ -5130,10 +5132,8 @@ async function openCacheManager() {
       <div style="flex:1;overflow-y:auto;min-height:60px">${rows}</div>
 
       <div style="font-size:10px;color:#666;line-height:1.6;margin-top:14px;padding-top:12px;border-top:1px solid #2a2a2a">
-        Manually finding the cache folder: hidden folder named <b>.wlm_thumbs</b> inside your Public shared folder (enable "show hidden files" first).<br>
-        <b>QNAP:</b> File Station → Public → ⋯ → Show hidden files → .wlm_thumbs<br>
-        <b>UGreen:</b> Files app → Public → settings → Show hidden files → .wlm_thumbs<br>
-        Container path: <span style="font-family:monospace;background:#111;padding:1px 4px;border-radius:3px">${server_path}</span>
+        This is the client's machine — there's no direct file browser access to it, only the button above. The client can also clear it themselves from their own WLM Sorting Service app ("Delete cache..." on its status screen).<br>
+        Cache path on their machine: <span style="font-family:monospace;background:#111;padding:1px 4px;border-radius:3px">${server_path}</span>
         <button id="_cacheCopyBtn" style="margin-left:4px;background:#333;border:none;color:#fff;border-radius:3px;cursor:pointer;font-size:10px;padding:2px 6px">Copy</button><br>
         A full browser-cache purge (beyond the button above) needs your browser's own settings — e.g. Chrome: Settings → Privacy and security → Clear browsing data → Cached images and files.
       </div>
