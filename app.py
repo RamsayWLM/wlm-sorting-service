@@ -2278,6 +2278,26 @@ def _init():
 threading.Thread(target=_init, daemon=True).start()
 
 
+# macOS's standalone Tailscale.app doesn't always put its CLI on PATH unless
+# the client turns that on manually (menu bar app -> "Install Tailscale
+# command line tool"). Fall back to its known install locations so a client
+# who just installed the app normally doesn't spin in the retry loop forever.
+_TAILSCALE_FALLBACK_PATHS = [
+    '/usr/local/bin/tailscale',
+    '/opt/homebrew/bin/tailscale',
+    '/Applications/Tailscale.app/Contents/MacOS/Tailscale',
+]
+
+
+def _tailscale_binary():
+    if shutil.which('tailscale'):
+        return 'tailscale'
+    for p in _TAILSCALE_FALLBACK_PATHS:
+        if Path(p).exists():
+            return p
+    return 'tailscale'
+
+
 def _get_tailscale_ip(retry_interval=5):
     """Block until `tailscale ip -4` returns an address, then return it.
 
@@ -2288,7 +2308,7 @@ def _get_tailscale_ip(retry_interval=5):
     while True:
         try:
             result = subprocess.run(
-                ['tailscale', 'ip', '-4'],
+                [_tailscale_binary(), 'ip', '-4'],
                 capture_output=True, text=True, timeout=5,
             )
             lines = result.stdout.strip().splitlines()
