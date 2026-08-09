@@ -1,27 +1,33 @@
 #!/usr/bin/env python3
 """Client-facing launcher for the WLM sorting service.
 
-Shows a minimal status window and runs the Flask server (app.py) as a
-background process. The client never sees a URL, login screen, or the
-sorting UI here — only WLM's team, connecting separately over Tailscale
-with the shared password, does.
+Shows a minimal status window and runs the Flask server (app.py) on a
+background thread, in-process. The client never sees a URL, login screen,
+or the sorting UI here — only WLM's team, connecting separately over
+Tailscale with the shared password, does.
+
+Runs Flask in-thread rather than as a subprocess so this can be frozen into
+a single PyInstaller executable: a frozen binary has no separate `python`
+interpreter or app.py file on disk to subprocess out to.
 """
 import atexit
 import os
 import signal
-import subprocess
-import sys
 import threading
 import tkinter as tk
 from pathlib import Path
 
-APP_DIR = Path(__file__).resolve().parent
-APP_PY = APP_DIR / 'app.py'
+# Must be set before `app` is imported — PHOTOS_DIR is read at module load
+# time. Bare-metal (non-Docker) runs need a real default; Docker deploys set
+# PHOTOS_DIR themselves via docker-compose, so this only fills the gap for a
+# plain double-clicked client build.
+os.environ.setdefault('PHOTOS_DIR', str(Path.home()))
+
+import app as server_app  # noqa: E402  (must follow the PHOTOS_DIR default above)
 
 STATUS_STARTING = "Starting sorting service..."
 STATUS_WAITING_TAILSCALE = "Waiting for Tailscale connection...\n(make sure you're signed in to Tailscale)"
 STATUS_READY = "Sorting service ready\nWaiting for connection"
-STATUS_STOPPED = "Sorting service stopped"
 STATUS_CRASHED = "Sorting service stopped unexpectedly\nPlease contact White Lights Media"
 
 
@@ -49,14 +55,13 @@ class ServiceShell:
             font=("-apple-system", 10),
         ).pack(side="bottom", pady=14)
 
-        self.proc = None
         self._stopped = False
 
-        # WM_DELETE_WINDOW only fires on a clean window close. A force-quit,
-        # crash, or `kill` sends SIGTERM/SIGINT straight past Tkinter, which
-        # would otherwise leave the Flask server orphaned and still running
-        # on the client's machine indefinitely.
-        atexit.register(self._kill_child)
+        # WM_DELETE_WINDOW only fires on a clean window close. A force-quit
+        # or `kill` sends SIGTERM/SIGINT straight past Tkinter — harmless now
+        # that Flask runs on a daemon thread in this same process (it dies
+        # with the process either way), but we still exit cleanly rather
+        # than leaving Tkinter in a half-torn-down state.
         signal.signal(signal.SIGTERM, self._on_signal)
         signal.signal(signal.SIGINT, self._on_signal)
 
@@ -64,53 +69,27 @@ class ServiceShell:
         self.root.after(0, lambda: self.status_var.set(text))
 
     def _run_server(self):
-        env = os.environ.copy()
-        # Bare-metal (non-Docker) run needs a real default — Docker deploys set
-        # PHOTOS_DIR themselves via docker-compose, so this only fills the gap
-        # for a plain double-clicked client build.
-        env.setdefault('PHOTOS_DIR', str(Path.home()))
-
         try:
-            self.proc = subprocess.Popen(
-                [sys.executable, '-u', str(APP_PY)],
-                cwd=str(APP_DIR),
-                env=env,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                bufsize=1,
-            )
-        except OSError:
-            self._set_status(STATUS_CRASHED)
-            return
-
-        self._set_status(STATUS_WAITING_TAILSCALE)
-        for line in self.proc.stdout:
-            if 'Binding to Tailscale IP' in line:
-                self._set_status(STATUS_READY)
-
+            self._set_status(STATUS_WAITING_TAILSCALE)
+            bind_host = server_app._get_tailscale_ip()
+            if self._stopped:
+                return
+            self._set_status(STATUS_READY)
+            port = int(os.environ.get('PORT', 5000))
+            server_app.app.run(host=bind_host, port=port, threaded=True, use_reloader=False)
+        except Exception:
+            pass
         if not self._stopped:
             self._set_status(STATUS_CRASHED)
 
-    def _kill_child(self):
-        self._stopped = True
-        if self.proc and self.proc.poll() is None:
-            try:
-                self.proc.terminate()
-                self.proc.wait(timeout=5)
-            except Exception:
-                try:
-                    self.proc.kill()
-                except Exception:
-                    pass
-
     def _on_signal(self, signum, frame):
-        self._kill_child()
+        self._stopped = True
         os._exit(0)
 
     def _on_close(self):
-        self._kill_child()
+        self._stopped = True
         self.root.destroy()
+        os._exit(0)  # Flask's dev server has no clean in-thread stop call; exiting the process is the only reliable way to take it down.
 
     def run(self):
         threading.Thread(target=self._run_server, daemon=True).start()
