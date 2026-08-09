@@ -2461,6 +2461,17 @@ function buildCellHTML(m, i) {
   </div>`;
 }
 
+async function _imgOfflineFallback(img) {
+  const p = img.closest('.grid-cell')?.dataset.path || img.closest('.video-row')?.dataset.path;
+  if (p && window.indexedDB) {
+    try {
+      const blob = await _idbGet('thumbs', `/thumb/${encPath(p)}`);
+      if (blob) { img.src = URL.createObjectURL(blob); return; }
+    } catch (e) {}
+  }
+  img.classList.add('loaded');
+}
+
 function _initImgLoading(container) {
   container.querySelectorAll('img:not([data-li])').forEach(img => {
     img.dataset.li = '1';
@@ -2471,34 +2482,58 @@ function _initImgLoading(container) {
     };
     if (img.complete) {
       _markLoaded();
-    } else {
-      img.addEventListener('load',  _markLoaded, {once: true});
-      img.addEventListener('error', async () => {
-        img._retries = (img._retries || 0) + 1;
-        if (img._retries <= 2) {
-          const s = img.src; img.src = '';
-          setTimeout(() => {
-            img.removeAttribute('data-li');
-            img.src = s;
-            _initImgLoading(img.parentElement || container);
-          }, 700 * img._retries);
-          return;
-        }
-        // Live load failed after retries (likely offline) -- fall back to a
-        // deliberately-stored offline copy if this file was ever prepared
-        // for offline. Rebuilt from data-path rather than img.src, since a
-        // retry above may have rewritten src to a resolved absolute URL
-        // that won't match the relative key it was stored under.
-        const p = img.closest('.grid-cell')?.dataset.path || img.closest('.video-row')?.dataset.path;
-        if (p && window.indexedDB) {
-          try {
-            const blob = await _idbGet('thumbs', `/thumb/${encPath(p)}`);
-            if (blob) { img.src = URL.createObjectURL(blob); return; }
-          } catch (e) {}
-        }
-        img.classList.add('loaded');
-      }, {once: true});
+      return;
     }
+
+    let settled = false;
+
+    const _retryOrFallBack = () => {
+      img._retries = (img._retries || 0) + 1;
+      if (img._retries <= 2) {
+        const s = img.src; img.src = '';
+        setTimeout(() => {
+          img.removeAttribute('data-li');
+          img.src = s;
+          _initImgLoading(img.parentElement || container);
+        }, 700 * img._retries);
+      } else {
+        _imgOfflineFallback(img);
+      }
+    };
+
+    img.addEventListener('load', () => {
+      if (settled) return;
+      settled = true;
+      _markLoaded();
+    }, {once: true});
+
+    img.addEventListener('error', () => {
+      if (settled) return;
+      settled = true;
+      _retryOrFallBack();
+    }, {once: true});
+
+    // Native <img> loads have no built-in timeout. A genuinely dead
+    // connection (Tailscale down, machine unreachable) can hang far past
+    // any of this is useful for — and worse, it ties up one of the
+    // browser's ~6 concurrent per-origin connection slots the whole time,
+    // which can starve every *other* request on the page (including the
+    // folder-listing fetch itself) rather than just this one image. If
+    // we're already known offline, skip straight to the stored fallback
+    // fast (retrying a connection we know is dead just adds delay);
+    // otherwise allow longer, since legitimate thumbnail generation for an
+    // uncached RAW file can genuinely take a few seconds — go through the
+    // normal retry path rather than treating it as failed outright.
+    setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      if (_isOffline) {
+        img.src = ''; // abort the pending request; not going to retry the real URL anyway
+        _imgOfflineFallback(img);
+      } else {
+        _retryOrFallBack(); // manages clearing/restoring src itself — don't clobber it here first
+      }
+    }, _isOffline ? 1500 : 5000);
   });
 }
 
