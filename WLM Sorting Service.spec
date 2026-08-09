@@ -50,6 +50,6 @@ coll = COLLECT(
 app = BUNDLE(
     coll,
     name='WLM Sorting Service.app',
-    icon=None,
+    icon='wlm_logo.icns',
     bundle_identifier=None,
 )

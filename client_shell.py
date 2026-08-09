@@ -29,16 +29,24 @@ import webbrowser
 from pathlib import Path
 from tkinter import filedialog
 
+from PIL import Image, ImageTk
+
+
+def _bundle_dir() -> Path:
+    """Where our own bundled files (static/, resources/) live: next to this
+    script in dev, or inside PyInstaller's extracted bundle dir once
+    packaged. sys._MEIPASS is PyInstaller's own answer to "where did my
+    datas/binaries actually land" — on macOS .app bundles that's
+    Contents/Resources, not next to the executable in Contents/MacOS, so
+    don't derive this from sys.executable."""
+    if getattr(sys, 'frozen', False):
+        return Path(sys._MEIPASS)
+    return Path(__file__).resolve().parent
+
 
 def _resource_dir() -> Path:
-    """Where bundled ffmpeg/exiftool live: next to this script in dev, or
-    inside PyInstaller's extracted bundle dir once packaged. sys._MEIPASS is
-    PyInstaller's own answer to "where did my datas/binaries actually land" —
-    on macOS .app bundles that's Contents/Resources, not next to the
-    executable in Contents/MacOS, so don't derive this from sys.executable."""
-    if getattr(sys, 'frozen', False):
-        return Path(sys._MEIPASS) / 'resources'
-    return Path(__file__).resolve().parent / 'resources'
+    """Where bundled ffmpeg/exiftool live."""
+    return _bundle_dir() / 'resources'
 
 
 def _setup_bundled_tools():
@@ -92,7 +100,23 @@ _COL_BG = "#181818"
 _COL_FG = "#e0e0e0"
 _COL_FG_DIM = "#707070"
 _COL_ACCENT = "#d4a017"
-_COL_BTN = "#2a2a2a"
+_COL_BTN = "#404040"
+_COL_BTN_FG = "#ffffff"
+_COL_BTN_DISABLED = "#2a2a2a"
+
+
+def _make_button(parent, text, command, bg, fg, bold=False, font_size=12):
+    """Plain tk.Button mostly ignores custom bg/fg on macOS — it always
+    renders as a native gray Aqua button regardless of what's passed in,
+    which is why buttons looked washed out. A Label styled and bound as a
+    button sidesteps that and actually shows our colors."""
+    btn = tk.Label(
+        parent, text=text, bg=bg, fg=fg,
+        font=("-apple-system", font_size, "bold" if bold else "normal"),
+        padx=14, pady=9, cursor="pointinghand",
+    )
+    btn.bind("<Button-1>", lambda e: command())
+    return btn
 
 
 def _load_config() -> dict:
@@ -154,27 +178,48 @@ class ServiceShell:
         for w in self.root.winfo_children():
             w.destroy()
 
+    def _logo_image(self, width):
+        """Cached per-width PhotoImage of the WLM logo. Tkinter drops an
+        image the moment nothing keeps a Python reference to it, so the
+        cache dict living on self is what keeps it on screen, not just an
+        optimization."""
+        if not hasattr(self, '_logo_cache'):
+            self._logo_cache = {}
+        if width not in self._logo_cache:
+            try:
+                img = Image.open(_bundle_dir() / 'static' / 'wlm_logo.png')
+                ratio = img.height / img.width
+                img = img.resize((width, round(width * ratio)), Image.LANCZOS)
+                self._logo_cache[width] = ImageTk.PhotoImage(img)
+            except Exception:
+                self._logo_cache[width] = None
+        return self._logo_cache[width]
+
     # ── First-run setup screen ──────────────────────────────────────────
 
     def _build_setup_screen(self):
         self._clear()
-        self.root.geometry("440x560")
+        self.root.geometry("440x540")
         pad = {'padx': 24}
 
-        tk.Label(
-            self.root, text="Welcome to the WLM Sorting Service", fg=_COL_FG, bg=_COL_BG,
-            font=("-apple-system", 15, "bold"), wraplength=390, justify="left",
-        ).pack(pady=(24, 12), **pad)
+        logo = self._logo_image(240)
+        if logo:
+            tk.Label(self.root, image=logo, bg=_COL_BG).pack(pady=(28, 16))
+        else:
+            tk.Label(
+                self.root, text="Welcome to the WLM Sorting Service", fg=_COL_FG, bg=_COL_BG,
+                font=("-apple-system", 15, "bold"), wraplength=390, justify="left",
+            ).pack(pady=(24, 12), **pad)
 
         tk.Label(
-            self.root, text=SETUP_STEPS_TEXT, fg="#b0b0b0", bg=_COL_BG,
+            self.root, text=SETUP_STEPS_TEXT, fg="#c8c8c8", bg=_COL_BG,
             font=("-apple-system", 12), wraplength=390, justify="left",
         ).pack(pady=(0, 14), **pad)
 
-        tk.Button(
-            self.root, text="Open Tailscale download page",
-            command=lambda: webbrowser.open('https://tailscale.com/download'),
-            bg=_COL_BTN, fg=_COL_FG, relief="flat", padx=10, pady=6,
+        _make_button(
+            self.root, "Open Tailscale download page",
+            lambda: webbrowser.open('https://tailscale.com/download'),
+            bg=_COL_BTN, fg=_COL_BTN_FG,
         ).pack(pady=(0, 20), **pad)
 
         tk.Frame(self.root, bg="#333", height=1).pack(fill='x', **pad)
@@ -188,32 +233,25 @@ class ServiceShell:
         tk.Label(
             self.root, textvariable=self._chosen_folder, fg=_COL_ACCENT, bg=_COL_BG,
             font=("-apple-system", 11), wraplength=390, justify="left",
-        ).pack(pady=(0, 6), **pad)
+        ).pack(pady=(0, 14), **pad)
 
-        tk.Label(
-            self.root,
-            text="Tip: a folder outside Desktop/Documents/Downloads avoids extra permission prompts.",
-            fg=_COL_FG_DIM, bg=_COL_BG, font=("-apple-system", 10),
-            wraplength=390, justify="left",
-        ).pack(pady=(0, 12), **pad)
-
-        tk.Button(
-            self.root, text="Browse...", command=self._on_browse,
-            bg=_COL_BTN, fg=_COL_FG, relief="flat", padx=10, pady=6,
+        _make_button(
+            self.root, "Browse...", self._on_browse, bg=_COL_BTN, fg=_COL_BTN_FG,
         ).pack(pady=(0, 20), **pad)
 
-        self._done_btn = tk.Button(
-            self.root, text="Done", command=self._on_setup_done, state='disabled',
-            bg=_COL_ACCENT, fg=_COL_BG, font=("-apple-system", 12, "bold"),
-            relief="flat", padx=10, pady=8,
+        self._done_btn = _make_button(
+            self.root, "Done", self._on_setup_done, bg=_COL_BTN_DISABLED, fg=_COL_FG_DIM, bold=True,
         )
+        self._done_btn.unbind("<Button-1>")
+        self._done_btn.configure(cursor="arrow")
         self._done_btn.pack(pady=(0, 24), **pad)
 
     def _on_browse(self):
         folder = filedialog.askdirectory(title="Choose a folder for White Lights Media")
         if folder:
             self._chosen_folder.set(folder)
-            self._done_btn.config(state='normal')
+            self._done_btn.configure(bg=_COL_ACCENT, fg=_COL_BG, cursor="pointinghand")
+            self._done_btn.bind("<Button-1>", lambda e: self._on_setup_done())
 
     def _on_setup_done(self):
         folder = self._chosen_folder.get()
@@ -224,11 +262,15 @@ class ServiceShell:
 
     def _begin_serving(self, folder):
         self._clear()
-        self.root.geometry("360x200")
+        self.root.geometry("360x240")
 
-        dot = tk.Canvas(self.root, width=16, height=16, bg=_COL_BG, highlightthickness=0)
-        dot.create_oval(2, 2, 14, 14, fill=_COL_ACCENT, outline="")
-        dot.pack(pady=(24, 8))
+        logo = self._logo_image(180)
+        if logo:
+            tk.Label(self.root, image=logo, bg=_COL_BG).pack(pady=(28, 12))
+        else:
+            dot = tk.Canvas(self.root, width=16, height=16, bg=_COL_BG, highlightthickness=0)
+            dot.create_oval(2, 2, 14, 14, fill=_COL_ACCENT, outline="")
+            dot.pack(pady=(24, 8))
 
         self.status_var = tk.StringVar(value=STATUS_STARTING)
         tk.Label(
@@ -236,10 +278,9 @@ class ServiceShell:
             font=("-apple-system", 13), wraplength=320, justify="center",
         ).pack(pady=4, expand=True)
 
-        tk.Button(
-            self.root, text="Change folder...", command=self._on_change_folder,
-            bg=_COL_BG, fg=_COL_FG_DIM, relief="flat", font=("-apple-system", 10),
-            borderwidth=0, highlightthickness=0,
+        _make_button(
+            self.root, "Change folder...", self._on_change_folder,
+            bg=_COL_BG, fg=_COL_FG_DIM, font_size=10,
         ).pack(pady=(0, 4))
 
         tk.Label(
