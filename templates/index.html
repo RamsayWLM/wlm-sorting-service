@@ -646,7 +646,8 @@
       <div class="stats-lbl" id="statsLbl"></div>
       <button class="show-hidden-btn" id="showHiddenBtn"
               style="display:none" onclick="showHiddenManager()">Show hidden folders</button>
-      <button class="cache-mgr-btn" onclick="openCacheManager()">Manage cache</button>
+      <button class="cache-mgr-btn" id="viewRejectedBtn" style="display:none;color:#e6b800" onclick="_showRejectedChanges()">View rejected offline changes</button>
+      <button class="cache-mgr-btn" style="margin-top:4px" onclick="openCacheManager()">Manage cache</button>
       <button class="cache-mgr-btn" style="margin-top:4px" onclick="_diagnoseOfflineFolder()">Diagnose offline issue</button>
       <button class="cache-mgr-btn" style="margin-top:4px" onclick="openCleanNames()">Clean folder names</button>
       <button class="cache-mgr-btn" id="aiSortBtn" style="margin-top:4px" onclick="openAiSort()">🤖 AI Sort Assistant</button>
@@ -980,6 +981,13 @@ try { _offlineQueue = JSON.parse(localStorage.getItem('wlm-offline-queue') || '[
 // stats poll naturally triggers the reconnect prompt for the leftover queue.
 let _isOffline = _offlineQueue.length > 0;
 
+// Changes explicitly declined at the reconnect prompt (accidental click,
+// or a genuine "not yet") aren't thrown away -- kept here so they can be
+// reviewed and re-applied later via the "View rejected offline changes"
+// sidebar button, rather than being unrecoverable the moment Stop is hit.
+let _rejectedQueue = [];
+try { _rejectedQueue = JSON.parse(localStorage.getItem('wlm-rejected-queue') || '[]'); } catch(e) {}
+
 // Now that this is served over HTTPS (Tailscale-issued cert), a Service
 // Worker is finally available — registered narrowly to solve the one thing
 // IndexedDB alone never could: reopening the app from scratch while fully
@@ -1065,31 +1073,46 @@ async function _idbGet(storeName, key) {
 async function api(url) {
   // If we already know we're offline (the periodic health-check already
   // failed), don't spend up to 6s re-discovering that on every single
-  // folder click before falling back — go straight to the stored copy.
-  // Still falls through to a live attempt below if nothing's stored,
-  // in case we're actually back online and just haven't polled yet.
+  // folder click before falling back -- go straight to the stored copy.
+  const cached = await _idbGet('listings', url).catch(() => undefined);
   if (_isOffline) {
-    const cached = await _idbGet('listings', url).catch(() => undefined);
     if (cached !== undefined) return cached;
+    // Nothing stored and we think we're offline -- still worth trying live
+    // in case we're actually back online and just haven't polled yet.
   }
-  let r;
-  try {
-    r = await _fetchWithTimeout(url, {}, 6000);
-  } catch (e) {
-    _setOffline(true);
-    const cached = await _idbGet('listings', url).catch(() => undefined);
-    if (cached !== undefined) return cached;
-    throw e;
+
+  const live = (async () => {
+    const r = await _fetchWithTimeout(url, {}, 6000);
+    if (!r.ok) throw new Error(r.status);
+    const data = await r.json();
+    // Opportunistically remember every listing we successfully fetch (folder
+    // tree included), not just ones an explicit "Generate cache" ran for.
+    // Without this, a from-scratch reload while offline had no folder tree
+    // to show at all -- Generate cache only ever populated individual
+    // folders' contents, never the /api/ls calls that build the sidebar.
+    _idbPut('listings', url, data).catch(() => {});
+    return data;
+  })();
+
+  if (cached === undefined) {
+    try {
+      return await live;
+    } catch (e) {
+      _setOffline(true);
+      throw e;
+    }
   }
-  if (!r.ok) throw new Error(r.status);
-  const data = await r.json();
-  // Opportunistically remember every listing we successfully fetch (folder
-  // tree included), not just ones an explicit "Generate cache" ran for.
-  // Without this, a from-scratch reload while offline had no folder tree to
-  // show at all -- Generate cache only ever populated individual folders'
-  // contents, never the /api/ls calls that build the sidebar itself.
-  _idbPut('listings', url, data).catch(() => {});
-  return data;
+
+  // A cached copy exists: don't make the UI wait on a full round-trip when
+  // the *server* is merely slow (e.g. its CPU pegged generating other
+  // thumbnails) even though the network itself is fine -- race the live
+  // fetch against a short deadline and use the cached copy if live hasn't
+  // won by then. The live fetch keeps running in the background regardless.
+  live.then(() => _setOffline(false)).catch(() => _setOffline(true));
+  return Promise.race([
+    live,
+    new Promise(resolve => setTimeout(() => resolve(cached), 500)),
+  ]).catch(() => cached);
 }
 
 function enc(s)     { return encodeURIComponent(s); }
@@ -1660,6 +1683,9 @@ function createFolderEl(f, fullPath, indentPx) {
 }
 
 async function toggleFolder(path, el, childIndentPx) {
+  // Same defensive cleanup as selectFolder() -- a stuck hover highlight on a
+  // row about to be collapsed/replaced won't get a matching mouseleave.
+  document.querySelectorAll('.folder-item.drop-target').forEach(x => x.classList.remove('drop-target'));
   let chevron = el.querySelector('.f-chevron');
   // Leaf folders render a spacer instead of a chevron — upgrade it on first expand
   if (!chevron) {
@@ -2178,6 +2204,13 @@ const _folderListCache = new Map(); // folder -> { resp, ts }
 const _FOLDER_CACHE_TTL = 5 * 60 * 1000; // 5 min -- long enough to skip the wait on a revisit, short enough to self-heal quickly if files changed
 
 async function selectFolder(name, el) {
+  // Defensive cleanup: the hover-based "drop-target" highlight (added on
+  // mouseenter while files are selected, cleared on mouseleave) can get
+  // left stuck on a folder row if the tree re-renders out from under a
+  // resting cursor -- no matching mouseleave ever fires on a row that gets
+  // replaced rather than actually left. Navigating to a different folder is
+  // a natural, frequent point to sweep away any such stragglers.
+  document.querySelectorAll('.folder-item.drop-target').forEach(x => x.classList.remove('drop-target'));
   if (_searchHighlightEl && _searchHighlightEl !== el) _clearSearchHighlight();
   if (activeItem) activeItem.classList.remove('active');
   activeItem = el;
@@ -2557,6 +2590,24 @@ function _initImgLoading(container) {
     }
 
     let settled = false;
+
+    // Race a locally-stored copy (from an earlier "Cache thumbnails" run)
+    // against the live request already in flight (img.src was set the
+    // moment this cell's HTML was inserted) -- whichever's ready first
+    // wins. A file's thumbnail bytes don't change once generated, so
+    // there's nothing to lose by preferring a fast local copy over a live
+    // request that's merely slow (e.g. NAS CPU pegged generating other
+    // thumbnails), not actually failed. Runs regardless of online state,
+    // not just as a last-resort fallback after a failure/timeout.
+    const _cellPath = img.closest('.grid-cell')?.dataset.path || img.closest('.video-row')?.dataset.path;
+    if (_cellPath && window.indexedDB) {
+      _idbGet('thumbs', `/thumb/${encPath(_cellPath)}`).then(blob => {
+        if (settled || !blob) return;
+        settled = true;
+        img.src = URL.createObjectURL(blob);
+        img.classList.add('loaded');
+      }).catch(() => {});
+    }
 
     const _retryOrFallBack = () => {
       img._retries = (img._retries || 0) + 1;
@@ -5140,6 +5191,7 @@ function dismissCacheToast() {
 // since these are real files on the client's disk, not database rows that
 // can be blindly replayed.
 if (_isOffline) document.addEventListener('DOMContentLoaded', () => _updateOfflineBanner());
+document.addEventListener('DOMContentLoaded', () => _updateRejectedButton());
 
 function _saveOfflineQueue() {
   try { localStorage.setItem('wlm-offline-queue', JSON.stringify(_offlineQueue)); } catch(e) {}
@@ -5238,14 +5290,80 @@ function _showReconnectPrompt() {
 
   overlay.querySelector('#_reconnectStopBtn').addEventListener('click', () => {
     overlay.remove();
+    // Not discarded outright -- kept so an accidental click (or a genuine
+    // "not right now") doesn't lose real, already-done sorting work. Visible
+    // via the "View rejected offline changes" sidebar button until someone
+    // explicitly restores or permanently discards them.
+    _rejectedQueue.push(..._offlineQueue);
+    _saveRejectedQueue();
     _offlineQueue = [];
     _saveOfflineQueue();
     _updateOfflineBanner();
-    $('statusLeft').textContent = 'Offline changes discarded — refresh to see the current folder state.';
+    _updateRejectedButton();
+    $('statusLeft').textContent = 'Offline changes set aside — see "View rejected offline changes" to restore them.';
   });
   overlay.querySelector('#_reconnectApplyBtn').addEventListener('click', () => {
     overlay.remove();
     _replayOfflineQueue();
+  });
+}
+
+function _saveRejectedQueue() {
+  try { localStorage.setItem('wlm-rejected-queue', JSON.stringify(_rejectedQueue)); } catch(e) {}
+}
+
+function _updateRejectedButton() {
+  const btn = $('viewRejectedBtn');
+  if (btn) btn.style.display = _rejectedQueue.length ? '' : 'none';
+}
+
+function _showRejectedChanges() {
+  if (!_rejectedQueue.length) return;
+  const esc = s => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  const items = _rejectedQueue.map(a => `<li style="margin-bottom:5px">${esc(_describeOfflineAction(a))}</li>`).join('');
+  const overlay = document.createElement('div');
+  overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.75);z-index:3000;display:flex;align-items:center;justify-content:center';
+  overlay.innerHTML = `
+    <div style="background:#1a1a1a;border:1px solid #333;border-radius:10px;padding:24px;width:420px;max-height:70vh;display:flex;flex-direction:column">
+      <div style="font-weight:600;font-size:15px;margin-bottom:6px;color:#e0e0e0">Rejected offline changes</div>
+      <div style="font-size:12px;color:var(--muted);margin-bottom:12px">
+        ${_rejectedQueue.length} change${_rejectedQueue.length !== 1 ? 's' : ''} previously set aside, not applied to the real files.
+      </div>
+      <ul style="font-size:12px;color:#c8c8c8;margin:0 0 18px;padding-left:18px;overflow-y:auto;flex:1">${items}</ul>
+      <div style="display:flex;gap:10px;justify-content:flex-end">
+        <button id="_rejectedDiscardBtn" style="background:#333;border:none;color:#e74c3c;border-radius:6px;padding:9px 14px;cursor:pointer;font-size:13px">Discard permanently</button>
+        <button id="_rejectedCloseBtn" style="background:#333;border:none;color:#e0e0e0;border-radius:6px;padding:9px 14px;cursor:pointer;font-size:13px">Close</button>
+        <button id="_rejectedApplyBtn" style="background:#d4a017;border:none;color:#181818;font-weight:700;border-radius:6px;padding:9px 14px;cursor:pointer;font-size:13px">Restore & apply now</button>
+      </div>
+    </div>`;
+  document.body.appendChild(overlay);
+
+  const discardBtn = overlay.querySelector('#_rejectedDiscardBtn');
+  discardBtn.addEventListener('click', () => {
+    if (discardBtn.dataset.armed !== '1') {
+      discardBtn.dataset.armed = '1';
+      discardBtn.textContent = 'Click again to confirm';
+      return;
+    }
+    overlay.remove();
+    _rejectedQueue = [];
+    _saveRejectedQueue();
+    _updateRejectedButton();
+  });
+  overlay.querySelector('#_rejectedCloseBtn').addEventListener('click', () => overlay.remove());
+  overlay.querySelector('#_rejectedApplyBtn').addEventListener('click', () => {
+    overlay.remove();
+    _offlineQueue.push(..._rejectedQueue);
+    _saveOfflineQueue();
+    _rejectedQueue = [];
+    _saveRejectedQueue();
+    _updateRejectedButton();
+    if (_isOffline) {
+      _updateOfflineBanner();
+      $('statusLeft').textContent = 'Restored — will apply once back online.';
+    } else {
+      _replayOfflineQueue();
+    }
   });
 }
 
@@ -5291,11 +5409,24 @@ async function _refreshOfflineSnapshotAfterMove(kind, bodyObj) {
   }
 }
 
+// Human-readable reason for a single skipped file within an otherwise-
+// successful move, e.g. because someone else already moved/replaced it
+// while this queue was waiting to be applied.
+function _skipReasonLabel(reason) {
+  if (reason === 'not_found') return 'already moved by someone else';
+  if (reason === 'duplicate') return 'already existed at destination';
+  if (reason === 'permission') return 'permission denied';
+  return reason || 'unknown reason';
+}
+
 async function _replayOfflineQueue() {
   const queue = _offlineQueue;
   _offlineQueue = [];
   _saveOfflineQueue();
-  let ok = 0, failed = 0;
+  const kindCounts = {};
+  let filesMoved = 0, filesSkipped = 0, failedActions = 0;
+  const skipReasonCounts = {};
+  const skipDetails = [];
   for (const action of queue) {
     try {
       const res = await fetch(action.url, {
@@ -5304,15 +5435,64 @@ async function _replayOfflineQueue() {
       });
       const data = await res.json().catch(() => ({}));
       if (res.ok && !data.error && data.ok !== false) {
-        ok++;
+        kindCounts[action.kind] = (kindCounts[action.kind] || 0) + 1;
+        if (action.kind === 'move') {
+          filesMoved += (data.moved || []).length;
+          for (const err of (data.errors || [])) {
+            filesSkipped++;
+            const label = _skipReasonLabel(err.reason);
+            skipReasonCounts[label] = (skipReasonCounts[label] || 0) + 1;
+            skipDetails.push(`${err.path || '(unknown path)'} — ${label}`);
+          }
+        }
         _refreshOfflineSnapshotAfterMove(action.kind, action.body).catch(() => {});
-      } else failed++;
-    } catch (e) { failed++; }
+      } else failedActions++;
+    } catch (e) { failedActions++; }
   }
   _updateOfflineBanner();
-  $('statusLeft').textContent = `Applied ${ok} offline change${ok !== 1 ? 's' : ''}` +
-    (failed ? `, ${failed} failed — refresh to check the current folder state` : ' — refreshing…');
   if (typeof _refreshTreeAt === 'function') { try { await _refreshTreeAt(null); } catch(e) {} }
+  _showReplaySummary({ kindCounts, filesMoved, filesSkipped, skipReasonCounts, skipDetails, failedActions });
+}
+
+// Deliberately aggregate counts rather than listing every file -- a single
+// offline session can easily involve thousands of files, and this needs to
+// stay readable on one screen regardless of scale. Per-file detail for the
+// (usually much smaller) skipped set is one click away via "Copy details".
+function _showReplaySummary({ kindCounts, filesMoved, filesSkipped, skipReasonCounts, skipDetails, failedActions }) {
+  const esc = s => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  const appliedParts = [];
+  if (filesMoved) appliedParts.push(`${filesMoved.toLocaleString()} file${filesMoved !== 1 ? 's' : ''} moved`);
+  if (kindCounts.rename) appliedParts.push(`${kindCounts.rename} rename${kindCounts.rename !== 1 ? 's' : ''}`);
+  if (kindCounts['move-folder']) appliedParts.push(`${kindCounts['move-folder']} folder move${kindCounts['move-folder'] !== 1 ? 's' : ''}`);
+  const appliedLine = appliedParts.length ? `Applied: ${appliedParts.join(', ')}.` : 'Nothing was applied.';
+
+  const skipLine = filesSkipped
+    ? `⚠ ${filesSkipped.toLocaleString()} file${filesSkipped !== 1 ? 's' : ''} skipped: ` +
+      Object.entries(skipReasonCounts).map(([label, n]) => `${n} ${label}`).join(', ') + '.'
+    : '';
+  const failLine = failedActions
+    ? `⚠ ${failedActions} action${failedActions !== 1 ? 's' : ''} failed outright — refresh to check the current folder state.`
+    : '';
+
+  const overlay = document.createElement('div');
+  overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.75);z-index:3000;display:flex;align-items:center;justify-content:center';
+  overlay.innerHTML = `
+    <div style="background:#1a1a1a;border:1px solid #333;border-radius:10px;padding:24px;width:420px">
+      <div style="font-weight:600;font-size:15px;margin-bottom:10px;color:#e0e0e0">Offline changes applied</div>
+      <div style="font-size:12px;color:#c8c8c8;line-height:1.6">${esc(appliedLine)}</div>
+      ${skipLine ? `<div style="font-size:12px;color:#e6b800;margin-top:8px;line-height:1.6">${esc(skipLine)}</div>` : ''}
+      ${failLine ? `<div style="font-size:12px;color:#e74c3c;margin-top:8px;line-height:1.6">${esc(failLine)}</div>` : ''}
+      <div style="display:flex;gap:10px;justify-content:flex-end;margin-top:18px">
+        ${skipDetails.length ? `<button id="_replayCopyBtn" style="background:#333;border:none;color:#e0e0e0;border-radius:6px;padding:9px 14px;cursor:pointer;font-size:13px">Copy details</button>` : ''}
+        <button id="_replayDismissBtn" style="background:#d4a017;border:none;color:#181818;font-weight:700;border-radius:6px;padding:9px 14px;cursor:pointer;font-size:13px">OK</button>
+      </div>
+    </div>`;
+  document.body.appendChild(overlay);
+  const copyBtn = overlay.querySelector('#_replayCopyBtn');
+  if (copyBtn) copyBtn.addEventListener('click', async () => {
+    try { await navigator.clipboard.writeText(skipDetails.join('\n')); copyBtn.textContent = 'Copied!'; } catch (e) {}
+  });
+  overlay.querySelector('#_replayDismissBtn').addEventListener('click', () => overlay.remove());
 }
 
 // fetch() has no default timeout — if a dropped connection black-holes
@@ -5407,11 +5587,24 @@ const OFFLINE_FETCH_CONCURRENCY = 6;
 // a stored blob right now and what the on-screen <img> actually ended up
 // with, so a real mismatch (or lack of one) is visible directly instead
 // of guessing from a screenshot.
+// Checks whether this folder is actually ready for offline use, in plain
+// language a non-technical user can act on -- not the raw IndexedDB/DOM
+// dump this used to show. Still useful for edge cases the underlying "cache
+// generated but thumbnails still blank" bug (fixed 2026-08-10) might not be
+// the only cause of, e.g. a browser extension interfering with storage in
+// a way that's hard to reproduce remotely -- the full technical detail is
+// still gathered and copied to the clipboard for that kind of support case,
+// just not shown as the headline message anymore.
 async function _diagnoseOfflineFolder() {
   const cells = [...document.querySelectorAll('#photoGrid .grid-cell[data-path], #videoList .video-row[data-path]')];
-  if (!cells.length) { alert('No folder items on screen to diagnose — open a folder first.'); return; }
-  const lines = [`indexedDB available: ${!!window.indexedDB}`, `isOffline flag: ${_isOffline}`, ''];
-  for (const cell of cells.slice(0, 25)) {
+  if (!cells.length) {
+    alert("No files are showing on screen right now — open a folder first, then run this again.");
+    return;
+  }
+  const techLines = [`indexedDB available: ${!!window.indexedDB}`, `isOffline flag: ${_isOffline}`, ''];
+  let missing = 0, cachedButNotShowing = 0, working = 0;
+  const checked = cells.slice(0, 200);
+  for (const cell of checked) {
     const p = cell.dataset.path;
     const key = `/thumb/${encPath(p)}`;
     let hasBlob = false, blobInfo = 'n/a';
@@ -5423,17 +5616,37 @@ async function _diagnoseOfflineFolder() {
       blobInfo = `ERROR: ${e.message}`;
     }
     const img = cell.querySelector('img');
+    const isShowing = img && img.classList.contains('loaded') && img.naturalWidth > 0;
+    if (!hasBlob) missing++;
+    else if (!isShowing) cachedButNotShowing++;
+    else working++;
     const imgState = img
       ? `src=${img.src.startsWith('blob:') ? 'blob:...' : img.src.slice(-40)} complete=${img.complete} naturalWidth=${img.naturalWidth} class="${img.className}"`
       : 'no <img> found';
-    lines.push(`${p.split('/').pop()}`);
-    lines.push(`  IndexedDB: ${hasBlob ? 'FOUND' : 'MISSING'} (${blobInfo})`);
-    lines.push(`  <img>: ${imgState}`);
+    techLines.push(`${p.split('/').pop()}`);
+    techLines.push(`  IndexedDB: ${hasBlob ? 'FOUND' : 'MISSING'} (${blobInfo})`);
+    techLines.push(`  <img>: ${imgState}`);
   }
-  if (cells.length > 25) lines.push(`\n(...and ${cells.length - 25} more, truncated)`);
-  const report = lines.join('\n');
-  alert(report);
-  try { await navigator.clipboard.writeText(report); } catch (e) {}
+  if (cells.length > checked.length) techLines.push(`\n(...and ${cells.length - checked.length} more, not checked)`);
+  try { await navigator.clipboard.writeText(techLines.join('\n')); } catch (e) {}
+
+  const total = checked.length;
+  let msg;
+  if (missing === 0 && cachedButNotShowing === 0) {
+    msg = `✓ All ${total} file${total !== 1 ? 's' : ''} in this folder are correctly saved for offline use.\n\n`
+      + `If images still aren't showing while offline, try a hard refresh once you're back online `
+      + `(Cmd+Shift+R on Mac, Ctrl+Shift+R on Windows).`;
+  } else if (missing > 0 && cachedButNotShowing === 0) {
+    msg = `⚠ ${missing} of ${total} file${total !== 1 ? 's' : ''} in this folder ${missing !== 1 ? "aren't" : "isn't"} saved for offline use yet.\n\n`
+      + `To fix: right-click this folder in the sidebar and choose "Cache thumbnails", `
+      + `then wait for the "✓ ready for offline" message before disconnecting.`;
+  } else {
+    msg = `⚠ ${cachedButNotShowing} file${cachedButNotShowing !== 1 ? 's are' : ' is'} saved locally but not displaying correctly`
+      + (missing ? `, and ${missing} ${missing !== 1 ? "aren't" : "isn't"} saved at all` : '') + `.\n\n`
+      + `This is unusual. Try a hard refresh first. If it keeps happening, contact White Lights Media `
+      + `support — the technical details for this folder have been copied to your clipboard, ready to paste in.`;
+  }
+  alert(msg);
 }
 
 // Walks the folder tree from `root` down, storing every level's /api/ls
