@@ -5434,6 +5434,13 @@ async function prefetchFolderThumbs(folder, expectedTotal) {
     let done = 0, stored = 0;
     const allJobs = uniquePaths.map(p => ({ url: `/thumb/${encPath(p)}`, path: p }));
     const jobs = allJobs.slice(); // worker() drains this via shift() -- keep allJobs intact for verification after
+    // Distinguishes "server never returned this thumbnail" from "we got it
+    // but couldn't store it" -- these need completely different fixes (one's
+    // a server-side/network problem, the other's a browser storage problem),
+    // and lumping them into one silent catch made a real failure impossible
+    // to diagnose without guessing.
+    let fetchFailCount = 0, storeFailCount = 0;
+    let lastFetchFailStatus = null, lastStoreFailError = null;
 
     const updateStatus = () => {
       const pct = Math.round(done / total * 100);
@@ -5453,11 +5460,22 @@ async function prefetchFolderThumbs(folder, expectedTotal) {
           const resp = await fetch(job.url);
           if (resp.ok) {
             const blob = await resp.blob();
-            await _idbPut('thumbs', job.url, blob);
-            stored++;
+            try {
+              await _idbPut('thumbs', job.url, blob);
+              stored++;
+            } catch (storeErr) {
+              storeFailCount++;
+              lastStoreFailError = storeErr.name + ': ' + storeErr.message;
+            }
+          } else {
+            fetchFailCount++;
+            lastFetchFailStatus = resp.status;
           }
           _markBrowserCached(job.path);
-        } catch (e) {}
+        } catch (e) {
+          fetchFailCount++;
+          lastFetchFailStatus = 'network error: ' + e.message;
+        }
         done++;
         if (done % 10 === 0 || done === total) updateStatus();
       }
@@ -5476,9 +5494,25 @@ async function prefetchFolderThumbs(folder, expectedTotal) {
         if (blob && blob.size > 0) verified++;
       } catch (e) {}
     }
-    if (statusText) statusText.textContent = verified === total
-      ? `✓ "${name}" ready for offline (${total} file${total !== 1 ? 's' : ''})`
-      : `⚠ "${name}": only ${verified}/${total} verified saved for offline`;
+
+    if (verified === total) {
+      if (statusText) statusText.textContent = `✓ "${name}" ready for offline (${total} file${total !== 1 ? 's' : ''})`;
+    } else {
+      let detail = [];
+      if (fetchFailCount) detail.push(`${fetchFailCount} failed to download (${lastFetchFailStatus})`);
+      if (storeFailCount) detail.push(`${storeFailCount} failed to save locally (${lastStoreFailError})`);
+      let quotaNote = '';
+      try {
+        if (navigator.storage?.estimate) {
+          const est = await navigator.storage.estimate();
+          const usedMB = Math.round((est.usage || 0) / 1048576);
+          const quotaMB = Math.round((est.quota || 0) / 1048576);
+          quotaNote = ` — browser storage: ${usedMB}MB used of ${quotaMB}MB available`;
+        }
+      } catch (e) {}
+      const detailStr = detail.length ? ' (' + detail.join(', ') + ')' : '';
+      if (statusText) statusText.textContent = `⚠ "${name}": only ${verified}/${total} verified saved for offline${detailStr}${quotaNote}`;
+    }
     // Left visible (not auto-hidden) once complete -- that confirmation is
     // exactly the reassurance needed before someone disconnects to go
     // offline, so it shouldn't disappear or get silently overwritten.

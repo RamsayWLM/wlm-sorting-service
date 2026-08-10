@@ -723,7 +723,12 @@ def _make_thumb_impl(src: Path, dst: Path) -> bool:
                         raw_orient = int(ro_str)
                 except Exception:
                     pass
-                for tag in ('-JpegFromRaw', '-PreviewImage'):
+                # -ThumbnailImage is the last resort: much lower resolution than a
+                # real preview, but some RAW formats (confirmed: Panasonic .rw2)
+                # only embed this and never JpegFromRaw/PreviewImage, which
+                # otherwise means a total 500 on every file of that type — no
+                # thumbnail is a much worse outcome than a small one.
+                for tag in ('-JpegFromRaw', '-PreviewImage', '-ThumbnailImage'):
                     try:
                         r_out = _run_exiftool(['-b', tag, str(src)], timeout=30)
                         if r_out is not None and len(r_out) > 2000:
