@@ -89,10 +89,13 @@ SETUP_STEPS_TEXT = (
     "2. Open Tailscale and sign in — any Google, Microsoft, or email account "
     "works. This creates your own free Tailscale account, completely "
     "separate from White Lights Media's.\n\n"
-    "3. Click the Tailscale icon in your menu bar, choose \"Share...\", "
+    "3. Open the Tailscale admin console (button below), go to the DNS tab, "
+    "and turn on \"HTTPS Certificates\". This is a one-time setting for your "
+    "account — it lets this app connect securely.\n\n"
+    "4. Click the Tailscale icon in your menu bar, choose \"Share...\", "
     "select this computer, and share it with:\n"
     f"        {WLM_TAILSCALE_SHARE_EMAIL}\n\n"
-    "4. Choose the folder below for White Lights Media to work in, then "
+    "5. Choose the folder below for White Lights Media to work in, then "
     "click Done."
 )
 
@@ -213,12 +216,18 @@ def _gather_diagnostics(folder: str) -> str:
         ts_ip = result.stdout.strip().splitlines()[0] if result.returncode == 0 and result.stdout.strip() else "not connected"
     except Exception:
         ts_ip = "tailscale not found"
+    try:
+        hostname = server_app._get_tailscale_hostname() or "not available yet"
+    except Exception:
+        hostname = "not available yet"
+    port = os.environ.get('PORT', 5000)
     return "\n".join([
         "WLM Sorting Service diagnostics",
         f"Version: {APP_VERSION}",
         f"Time: {time.strftime('%Y-%m-%d %H:%M:%S')}",
         f"Working folder: {folder}",
         f"Tailscale IP: {ts_ip}",
+        f"Address for White Lights Media to use: https://{hostname}:{port}",
         f"ffmpeg found: {bool(shutil.which('ffmpeg'))}",
         f"exiftool found: {bool(shutil.which('exiftool'))}",
         f"Cache folder: {os.environ.get('THUMB_DIR', 'n/a')}",
@@ -291,7 +300,7 @@ class ServiceShell:
 
     def _build_setup_screen(self):
         self._clear()
-        self.root.geometry("440x580")
+        self.root.geometry("440x660")
         pad = {'padx': 24}
 
         logo = self._logo_image(240)
@@ -311,6 +320,12 @@ class ServiceShell:
         _make_button(
             self.root, "Open Tailscale download page",
             lambda: webbrowser.open('https://tailscale.com/download'),
+            bg=_COL_BTN, fg=_COL_BTN_FG,
+        ).pack(pady=(0, 10), **pad)
+
+        _make_button(
+            self.root, "Open Tailscale admin console (for step 3)",
+            lambda: webbrowser.open('https://login.tailscale.com/admin/dns'),
             bg=_COL_BTN, fg=_COL_BTN_FG,
         ).pack(pady=(0, 20), **pad)
 
@@ -496,23 +511,27 @@ class ServiceShell:
         self.root.after(0, _update)
 
     def _run_server(self):
-        # Outer loop re-fetches the Tailscale IP on every bind failure rather
-        # than retrying the same address — Tailscale can stop/restart with a
-        # different (or the same, briefly-stale) address mid-session, and
-        # _get_tailscale_ip() itself blocks correctly on "not really
-        # connected" now. This runs indefinitely rather than giving up,
-        # since Tailscale being down could last anywhere from a second (the
-        # old-process handoff on a folder change) to however long the client
-        # takes to notice and reconnect it.
+        # Outer loop re-fetches Tailscale IP/hostname/cert on every bind
+        # failure rather than retrying the same address — Tailscale can
+        # stop/restart with a different (or the same, briefly-stale) address
+        # mid-session, and _get_tailscale_https_info() itself blocks
+        # correctly on "not really connected" or "cert not available yet"
+        # now. This runs indefinitely rather than giving up, since Tailscale
+        # being down could last anywhere from a second (the old-process
+        # handoff on a folder change) to however long the client takes to
+        # notice and reconnect it, or to enable HTTPS Certificates.
         port = int(os.environ.get('PORT', 5000))
         while not self._stopped:
             try:
                 self._set_status('waiting')
-                bind_host = server_app._get_tailscale_ip()
+                bind_host, hostname, certfile, keyfile = server_app._get_tailscale_https_info()
                 if self._stopped:
                     return
                 self._set_status('ready')
-                server_app.app.run(host=bind_host, port=port, threaded=True, use_reloader=False)
+                server_app.app.run(
+                    host=bind_host, port=port, threaded=True, use_reloader=False,
+                    ssl_context=(certfile, keyfile),
+                )
                 return  # app.run() only returns on a real shutdown, not expected here
             except OSError:
                 if self._stopped:

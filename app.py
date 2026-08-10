@@ -2398,7 +2398,77 @@ def _get_tailscale_ip(retry_interval=5):
         time.sleep(retry_interval)
 
 
+def _get_tailscale_hostname():
+    """This device's MagicDNS name (e.g. foo.tailxxxx.ts.net), trailing dot
+    stripped. HTTPS certs are issued for hostnames, not raw IPs — a browser
+    can't validate a certificate against an IP address at all."""
+    try:
+        result = subprocess.run(
+            [_tailscale_binary(), 'status', '--json'],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode == 0:
+            data = json.loads(result.stdout)
+            dns_name = data.get('Self', {}).get('DNSName', '')
+            if dns_name:
+                return dns_name.rstrip('.')
+    except Exception:
+        pass
+    return None
+
+
+_TLS_CERT_DIR = Path(os.environ.get('TLS_CERT_DIR', str(Path.home() / '.wlm_sorting_tls')))
+
+
+def _get_tailscale_https_cert(hostname):
+    """Runs `tailscale cert` for this hostname; returns (certfile, keyfile) on
+    success or None. Safe and cheap to call on every startup instead of
+    tracking expiry ourselves — Tailscale's own cert command is idempotent
+    and only does real work when a renewal is actually needed. Fails (returns
+    None) until the client has turned on "HTTPS Certificates" for their
+    Tailscale account — a one-time setting, not something on our side."""
+    try:
+        _TLS_CERT_DIR.mkdir(parents=True, exist_ok=True)
+        certfile = _TLS_CERT_DIR / f'{hostname}.crt'
+        keyfile = _TLS_CERT_DIR / f'{hostname}.key'
+        result = subprocess.run(
+            [_tailscale_binary(), 'cert', f'--cert-file={certfile}', f'--key-file={keyfile}', hostname],
+            capture_output=True, text=True, timeout=30,
+        )
+        if result.returncode == 0 and certfile.exists() and keyfile.exists():
+            return str(certfile), str(keyfile)
+    except Exception:
+        pass
+    return None
+
+
+def _get_tailscale_https_info(retry_interval=5):
+    """Blocks until Tailscale is connected AND an HTTPS cert is available for
+    it. Returns (bind_ip, hostname, certfile, keyfile)."""
+    bind_ip = _get_tailscale_ip(retry_interval)  # blocks on its own until genuinely connected
+    while True:
+        hostname = _get_tailscale_hostname()
+        if not hostname:
+            print(f"[startup] Waiting for Tailscale hostname (retrying in {retry_interval}s)...", flush=True)
+            time.sleep(retry_interval)
+            continue
+        cert = _get_tailscale_https_cert(hostname)
+        if not cert:
+            print(
+                f"[startup] Waiting for HTTPS Certificates to be enabled on this Tailscale "
+                f"account (retrying in {retry_interval}s)... Enable it at "
+                f"https://login.tailscale.com/admin/dns", flush=True,
+            )
+            time.sleep(retry_interval)
+            continue
+        certfile, keyfile = cert
+        return bind_ip, hostname, certfile, keyfile
+
+
 if __name__ == '__main__':
-    bind_host = _get_tailscale_ip()
-    print(f"[startup] Binding to Tailscale IP {bind_host} only — not reachable via localhost or LAN.", flush=True)
-    app.run(host=bind_host, port=int(os.environ.get('PORT', 5000)), threaded=True, use_reloader=False)
+    bind_host, hostname, certfile, keyfile = _get_tailscale_https_info()
+    print(f"[startup] Binding to https://{hostname}:{os.environ.get('PORT', 5000)} only — not reachable via localhost or LAN.", flush=True)
+    app.run(
+        host=bind_host, port=int(os.environ.get('PORT', 5000)), threaded=True,
+        use_reloader=False, ssl_context=(certfile, keyfile),
+    )
