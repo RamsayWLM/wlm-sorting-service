@@ -5160,8 +5160,18 @@ function _applyOfflineOverlay(folderName, items) {
 
 function _describeOfflineAction(action) {
   if (action.kind === 'move') {
-    const n = (action.body.paths || []).length;
-    return `${n} file${n !== 1 ? 's' : ''} moved to "${(action.body.to || '').split('/').pop() || action.body.to}"`;
+    const paths = action.body.paths || [];
+    const n = paths.length;
+    const to = (action.body.to || '').split('/').pop() || action.body.to;
+    // A single "move selected" action always originates from one currently-
+    // viewed folder, so the first path's parent covers the real case; if
+    // paths ever span multiple sources (shouldn't normally happen), just
+    // says "multiple locations" rather than picking one arbitrarily.
+    const fromSet = new Set(paths.map(p => p.includes('/') ? p.slice(0, p.lastIndexOf('/')) : ''));
+    const from = fromSet.size === 1
+      ? ((([...fromSet][0]).split('/').pop()) || 'top level')
+      : 'multiple locations';
+    return `${n} file${n !== 1 ? 's' : ''} moved from "${from}" to "${to}"`;
   }
   if (action.kind === 'rename') {
     return `"${(action.body.path || '').split('/').pop()}" renamed to "${action.body.name}"`;
