@@ -439,7 +439,31 @@ class ServiceShell:
 
         _import_server_app(folder)
         threading.Thread(target=self._run_server, daemon=True).start()
+        threading.Thread(target=self._run_cert_renewal_watcher, daemon=True).start()
         self._update_stats()
+
+    def _run_cert_renewal_watcher(self):
+        """Tailscale certs are valid ~90 days, and re-requesting one is cheap
+        and idempotent — the only real gap is that this already-running
+        server won't notice a freshly-issued cert file on disk by itself
+        (Flask loads its SSL context once at startup). Checking twice a day
+        and restarting (the same clean handoff already used by "Change
+        folder"/"Restart service") a couple weeks ahead of actual expiry
+        means renewal never needs a human to notice or do anything."""
+        while not self._stopped:
+            time.sleep(6 * 3600)
+            if self._stopped:
+                return
+            try:
+                hostname = server_app._get_tailscale_hostname()
+                if not hostname:
+                    continue
+                certfile = server_app._TLS_CERT_DIR / f'{hostname}.crt'
+                if certfile.exists() and server_app._cert_expires_soon(certfile):
+                    self._stopped = True
+                    _restart_app()
+            except Exception:
+                pass
 
     def _update_stats(self):
         try:

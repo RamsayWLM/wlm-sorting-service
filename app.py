@@ -14,7 +14,7 @@ import zipfile
 
 import psutil
 from concurrent.futures import ThreadPoolExecutor
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from io import BytesIO
 from pathlib import Path
 
@@ -118,7 +118,7 @@ def logout():
 
 @app.before_request
 def _require_login():
-    if request.endpoint in ('login', 'logout', 'static', 'api_matcher_heartbeat',
+    if request.endpoint in ('login', 'logout', 'static', 'service_worker', 'api_matcher_heartbeat',
                             'api_matcher_photos_in', 'api_matcher_thumb',
                             'api_matcher_next_job', 'api_matcher_job_update'):
         return
@@ -1131,6 +1131,51 @@ def _watcher_loop():
 @app.route('/')
 def index():
     return render_template('index.html')
+
+
+# Scoped narrowly to just the app shell (this page + its couple of small
+# static assets) -- everything else (API calls, thumbnails) is already
+# handled by the page's own IndexedDB-based offline logic, built before
+# HTTPS was available and working well; this only closes the one gap that
+# genuinely required a Service Worker: reopening the app from scratch
+# while fully disconnected, which IndexedDB alone can never do since it
+# only stores data for a page that's already loaded, not the page itself.
+_SERVICE_WORKER_JS = """
+const SHELL_CACHE = 'wlm-shell-v1';
+const SHELL_URLS = ['/', '/logo', '/static/favicon.png'];
+
+self.addEventListener('install', event => {
+  event.waitUntil(
+    caches.open(SHELL_CACHE)
+      .then(cache => Promise.all(SHELL_URLS.map(u => fetch(u).then(r => r.ok && cache.put(u, r)).catch(() => {}))))
+  );
+  self.skipWaiting();
+});
+
+self.addEventListener('activate', event => { self.clients.claim(); });
+
+self.addEventListener('fetch', event => {
+  const req = event.request;
+  const url = new URL(req.url);
+  if (req.mode !== 'navigate' && !SHELL_URLS.includes(url.pathname)) return;
+  event.respondWith(
+    fetch(req)
+      .then(resp => {
+        if (resp.ok) {
+          const copy = resp.clone();
+          caches.open(SHELL_CACHE).then(cache => cache.put(req, copy)).catch(() => {});
+        }
+        return resp;
+      })
+      .catch(() => caches.match(req).then(cached => cached || caches.match('/')))
+  );
+});
+"""
+
+
+@app.route('/sw.js')
+def service_worker():
+    return Response(_SERVICE_WORKER_JS, mimetype='application/javascript')
 
 
 @app.route('/push', methods=['POST'])
@@ -2440,6 +2485,27 @@ def _get_tailscale_https_cert(hostname):
     except Exception:
         pass
     return None
+
+
+def _cert_expires_soon(certfile, days_threshold=14) -> bool:
+    """True if `certfile` expires within `days_threshold` days, or if its
+    expiry can't be determined at all (fails safe — treat "can't tell" as
+    "renew to be sure"). The running server won't pick up a freshly
+    re-issued cert file on its own (Flask loads the SSL context once at
+    startup), so this is used to trigger a clean restart ahead of actual
+    expiry rather than as a standalone check."""
+    try:
+        result = subprocess.run(
+            ['openssl', 'x509', '-enddate', '-noout', '-in', str(certfile)],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode != 0:
+            return True
+        date_str = result.stdout.strip().split('=', 1)[1]
+        expiry = datetime.strptime(date_str, '%b %d %H:%M:%S %Y %Z').replace(tzinfo=timezone.utc)
+        return (expiry - datetime.now(timezone.utc)).days < days_threshold
+    except Exception:
+        return True
 
 
 def _get_tailscale_https_info(retry_interval=5):
