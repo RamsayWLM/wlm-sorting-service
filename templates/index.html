@@ -2473,7 +2473,19 @@ async function _imgOfflineFallback(img) {
   if (p && window.indexedDB) {
     try {
       const blob = await _idbGet('thumbs', `/thumb/${encPath(p)}`);
-      if (blob) { img.src = URL.createObjectURL(blob); return; }
+      if (blob) {
+        img.src = URL.createObjectURL(blob);
+        // The original 'load' listener from the failed attempt is still
+        // attached but already inert (its `settled` flag was set true
+        // right before this function was called), so it silently no-ops
+        // when this new blob: src finishes loading -- .loaded never gets
+        // added, and CSS keeps the image at opacity:0 despite it having
+        // genuinely valid image data (this was the actual bug: images
+        // reported as "successfully" using a blob: URL but remained
+        // invisible). Add it here directly instead of relying on that.
+        img.classList.add('loaded');
+        return;
+      }
     } catch (e) {}
   }
   img.classList.add('loaded');
