@@ -5233,6 +5233,48 @@ function _showReconnectPrompt() {
   });
 }
 
+// Keeps a folder's offline snapshot from silently going stale between
+// explicit "Cache thumbnails" runs. Without this, a real move made while
+// online (or replayed after reconnecting) leaves the *offline* copy of
+// affected folders pointing at where files used to be -- not a risk to the
+// real files themselves, but confusing next time the connection drops and
+// browsing shows outdated folder contents. Only touches folders that were
+// already prepared for offline (checked via the listing key existing) --
+// this isn't meant to start caching folders nobody opted into.
+async function _refreshOfflineSnapshotAfterMove(kind, bodyObj) {
+  if (!window.indexedDB) return;
+  const parentOf = p => (p && p.includes('/')) ? p.slice(0, p.lastIndexOf('/')) : '';
+  let affected = [];
+  if (kind === 'move') {
+    affected = [bodyObj.to, ...new Set((bodyObj.paths || []).map(parentOf))];
+  } else if (kind === 'move-folder') {
+    affected = [bodyObj.dest || '', parentOf(bodyObj.src || '')];
+  } else if (kind === 'rename') {
+    affected = [parentOf(bodyObj.path || '')];
+  }
+  for (const folder of new Set(affected)) {
+    const url = `/api/photos-in/${encPath(folder)}`;
+    const hadCache = await _idbGet('listings', url).catch(() => undefined);
+    if (hadCache === undefined) continue;
+    try {
+      const resp = await fetch(url);
+      if (!resp.ok) continue;
+      const data = await resp.json();
+      await _idbPut('listings', url, data);
+      const items = Array.isArray(data) ? data : data.items;
+      for (const item of (items || [])) {
+        const thumbUrl = `/thumb/${encPath(item.path)}`;
+        const already = await _idbGet('thumbs', thumbUrl).catch(() => undefined);
+        if (already) continue; // a file's bytes don't change on move, only which folder it's cached under
+        try {
+          const tResp = await fetch(thumbUrl);
+          if (tResp.ok) await _idbPut('thumbs', thumbUrl, await tResp.blob());
+        } catch (e) {}
+      }
+    } catch (e) {}
+  }
+}
+
 async function _replayOfflineQueue() {
   const queue = _offlineQueue;
   _offlineQueue = [];
@@ -5245,7 +5287,10 @@ async function _replayOfflineQueue() {
         body: JSON.stringify(action.body),
       });
       const data = await res.json().catch(() => ({}));
-      if (res.ok && !data.error && data.ok !== false) ok++; else failed++;
+      if (res.ok && !data.error && data.ok !== false) {
+        ok++;
+        _refreshOfflineSnapshotAfterMove(action.kind, action.body).catch(() => {});
+      } else failed++;
     } catch (e) { failed++; }
   }
   _updateOfflineBanner();
@@ -5275,10 +5320,12 @@ async function _fetchWithTimeout(url, options, timeoutMs) {
 async function _sendOrQueue(kind, url, bodyObj) {
   if (!_isOffline) {
     try {
-      return await _fetchWithTimeout(url, {
+      const res = await _fetchWithTimeout(url, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(bodyObj),
       }, 5000);
+      if (res.ok) _refreshOfflineSnapshotAfterMove(kind, bodyObj).catch(() => {});
+      return res;
     } catch (e) {
       _setOffline(true);  // fall through to queueing now that we know we're offline
     }
