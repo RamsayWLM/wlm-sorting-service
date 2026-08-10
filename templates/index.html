@@ -610,6 +610,12 @@
           <div id="cacheProgressBar" style="height:100%;background:var(--gold);border-radius:2px;width:0%;transition:width 0.4s"></div>
         </div>
       </div>
+      <div id="offlinePrepStatusBar" style="margin-top:4px;display:none">
+        <div id="offlinePrepStatusText" style="font-size:10px;color:var(--gold)"></div>
+        <div id="offlinePrepProgressWrap" style="display:none;height:3px;background:var(--border);border-radius:2px;margin-top:4px;overflow:hidden">
+          <div id="offlinePrepProgressBar" style="height:100%;background:var(--gold);border-radius:2px;width:0%;transition:width 0.4s"></div>
+        </div>
+      </div>
     </div>
 
     <div class="divider"></div>
@@ -5290,13 +5296,21 @@ async function _enumerateAndStoreFolders(root) {
 
 async function prefetchFolderThumbs(folder, expectedTotal) {
   if (!window.indexedDB) return;
-  const sidebarText = $('cacheStatusText');
-  const sidebarWrap = $('cacheProgressWrap');
-  const sidebarBar  = $('cacheProgressBar');
+  // Deliberately a separate element from the general cache-status sidebar
+  // (#cacheStatusText) — that one is overwritten every few seconds by an
+  // unrelated periodic poller (_pollStatus), which was silently clobbering
+  // this progress text with a misleading "Cache synced" message while this
+  // was still running in the background, making it look done before it
+  // actually was.
+  const statusBar  = $('offlinePrepStatusBar');
+  const statusText = $('offlinePrepStatusText');
+  const wrap       = $('offlinePrepProgressWrap');
+  const bar        = $('offlinePrepProgressBar');
   const name = folder.split('/').pop();
   try {
-    if (sidebarText) { sidebarText.textContent = `Preparing "${name}" for offline…`; sidebarText.style.color = 'var(--gold)'; }
-    if (sidebarWrap) sidebarWrap.style.display = '';
+    if (statusBar) statusBar.style.display = '';
+    if (statusText) statusText.textContent = `Preparing "${name}" for offline…`;
+    if (wrap) wrap.style.display = '';
 
     // /api/photos-in is already recursive server-side, but each stored
     // listing is matched by its own exact URL — a subfolder browsed offline
@@ -5320,17 +5334,19 @@ async function prefetchFolderThumbs(folder, expectedTotal) {
 
     const uniquePaths = [...new Set(allFiles.map(m => m.path))];
     const total = uniquePaths.length;
-    if (!total) { if (sidebarWrap) sidebarWrap.style.display = 'none'; return; }
+    if (!total) { if (statusBar) statusBar.style.display = 'none'; return; }
 
     let done = 0;
     const jobs = uniquePaths.map(p => ({ url: `/thumb/${encPath(p)}`, path: p }));
 
-    const updateSidebar = () => {
+    const updateStatus = () => {
       const pct = Math.round(done / total * 100);
-      if (sidebarText) sidebarText.textContent = done < total ? `Offline-ready: ${name} — ${done}/${total} (${pct}%)` : `Offline-ready — ${total} thumbnails`;
-      if (sidebarWrap) { sidebarWrap.style.display = done < total ? '' : 'none'; if (sidebarBar) sidebarBar.style.width = pct + '%'; }
+      if (statusText) statusText.textContent = done < total
+        ? `Preparing "${name}" for offline — ${done}/${total} (${pct}%)`
+        : `✓ "${name}" ready for offline (${total} file${total !== 1 ? 's' : ''})`;
+      if (wrap) { wrap.style.display = done < total ? '' : 'none'; if (bar) bar.style.width = pct + '%'; }
     };
-    updateSidebar();
+    updateStatus();
 
     const worker = async () => {
       while (jobs.length) {
@@ -5344,11 +5360,16 @@ async function prefetchFolderThumbs(folder, expectedTotal) {
           _markBrowserCached(job.path);
         } catch (e) {}
         done++;
-        if (done % 10 === 0 || done === total) updateSidebar();
+        if (done % 10 === 0 || done === total) updateStatus();
       }
     };
     await Promise.all(Array.from({ length: Math.min(OFFLINE_FETCH_CONCURRENCY, total) }, worker));
-  } catch (e) {}
+    // Left visible (not auto-hidden) once complete -- that confirmation is
+    // exactly the reassurance needed before someone disconnects to go
+    // offline, so it shouldn't disappear or get silently overwritten.
+  } catch (e) {
+    if (statusText) statusText.textContent = `Failed to prepare "${name}" for offline`;
+  }
 }
 
 // ── Download selected ──────────────────────────────────────────────────────────
