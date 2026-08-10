@@ -647,6 +647,7 @@
       <button class="show-hidden-btn" id="showHiddenBtn"
               style="display:none" onclick="showHiddenManager()">Show hidden folders</button>
       <button class="cache-mgr-btn" onclick="openCacheManager()">Manage cache</button>
+      <button class="cache-mgr-btn" style="margin-top:4px" onclick="_diagnoseOfflineFolder()">Diagnose offline issue</button>
       <button class="cache-mgr-btn" style="margin-top:4px" onclick="openCleanNames()">Clean folder names</button>
       <button class="cache-mgr-btn" id="aiSortBtn" style="margin-top:4px" onclick="openAiSort()">🤖 AI Sort Assistant</button>
       <button class="cache-mgr-btn" style="margin-top:4px" onclick="openTrash()">🗑️ Recycle Bin</button>
@@ -5267,6 +5268,41 @@ async function _sendOrQueue(kind, url, bodyObj) {
 // IndexedDB instead (see _idbPut/_idbGet above) — api() and image loading
 // both explicitly check it when a live request fails.
 const OFFLINE_FETCH_CONCURRENCY = 6;
+
+// One-click diagnostic for "cache generated but thumbnails still blank"
+// reports — no dev tools needed. Run this while looking at the broken
+// folder: checks, for every visible item, whether IndexedDB actually has
+// a stored blob right now and what the on-screen <img> actually ended up
+// with, so a real mismatch (or lack of one) is visible directly instead
+// of guessing from a screenshot.
+async function _diagnoseOfflineFolder() {
+  const cells = [...document.querySelectorAll('#photoGrid .grid-cell[data-path], #videoList .video-row[data-path]')];
+  if (!cells.length) { alert('No folder items on screen to diagnose — open a folder first.'); return; }
+  const lines = [`indexedDB available: ${!!window.indexedDB}`, `isOffline flag: ${_isOffline}`, ''];
+  for (const cell of cells.slice(0, 25)) {
+    const p = cell.dataset.path;
+    const key = `/thumb/${encPath(p)}`;
+    let hasBlob = false, blobInfo = 'n/a';
+    try {
+      const blob = await _idbGet('thumbs', key);
+      hasBlob = !!blob;
+      blobInfo = blob ? `${blob.type || '?'}, ${blob.size}b` : 'not found';
+    } catch (e) {
+      blobInfo = `ERROR: ${e.message}`;
+    }
+    const img = cell.querySelector('img');
+    const imgState = img
+      ? `src=${img.src.startsWith('blob:') ? 'blob:...' : img.src.slice(-40)} complete=${img.complete} naturalWidth=${img.naturalWidth} class="${img.className}"`
+      : 'no <img> found';
+    lines.push(`${p.split('/').pop()}`);
+    lines.push(`  IndexedDB: ${hasBlob ? 'FOUND' : 'MISSING'} (${blobInfo})`);
+    lines.push(`  <img>: ${imgState}`);
+  }
+  if (cells.length > 25) lines.push(`\n(...and ${cells.length - 25} more, truncated)`);
+  const report = lines.join('\n');
+  alert(report);
+  try { await navigator.clipboard.writeText(report); } catch (e) {}
+}
 
 // Walks the folder tree from `root` down, storing every level's /api/ls
 // response as it goes (so offline sidebar navigation works, not just the
