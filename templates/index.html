@@ -5336,14 +5336,17 @@ async function prefetchFolderThumbs(folder, expectedTotal) {
     const total = uniquePaths.length;
     if (!total) { if (statusBar) statusBar.style.display = 'none'; return; }
 
-    let done = 0;
-    const jobs = uniquePaths.map(p => ({ url: `/thumb/${encPath(p)}`, path: p }));
+    let done = 0, stored = 0;
+    const allJobs = uniquePaths.map(p => ({ url: `/thumb/${encPath(p)}`, path: p }));
+    const jobs = allJobs.slice(); // worker() drains this via shift() -- keep allJobs intact for verification after
 
     const updateStatus = () => {
       const pct = Math.round(done / total * 100);
       if (statusText) statusText.textContent = done < total
         ? `Preparing "${name}" for offline — ${done}/${total} (${pct}%)`
-        : `✓ "${name}" ready for offline (${total} file${total !== 1 ? 's' : ''})`;
+        : (stored === total
+            ? `✓ "${name}" ready for offline (${total} file${total !== 1 ? 's' : ''})`
+            : `⚠ "${name}": ${stored}/${total} saved for offline — some thumbnails failed`);
       if (wrap) { wrap.style.display = done < total ? '' : 'none'; if (bar) bar.style.width = pct + '%'; }
     };
     updateStatus();
@@ -5356,6 +5359,7 @@ async function prefetchFolderThumbs(folder, expectedTotal) {
           if (resp.ok) {
             const blob = await resp.blob();
             await _idbPut('thumbs', job.url, blob);
+            stored++;
           }
           _markBrowserCached(job.path);
         } catch (e) {}
@@ -5364,6 +5368,22 @@ async function prefetchFolderThumbs(folder, expectedTotal) {
       }
     };
     await Promise.all(Array.from({ length: Math.min(OFFLINE_FETCH_CONCURRENCY, total) }, worker));
+
+    // Trust but verify: `stored` only counts attempts that didn't throw --
+    // it doesn't rule out a write silently not actually persisting (a
+    // storage-quota eviction, a browser-specific IndexedDB quirk, etc.).
+    // Read every key back for real before declaring success, since a false
+    // "ready for offline" is worse than a slower, honest one.
+    let verified = 0;
+    for (const job of allJobs) {
+      try {
+        const blob = await _idbGet('thumbs', job.url);
+        if (blob && blob.size > 0) verified++;
+      } catch (e) {}
+    }
+    if (statusText) statusText.textContent = verified === total
+      ? `✓ "${name}" ready for offline (${total} file${total !== 1 ? 's' : ''})`
+      : `⚠ "${name}": only ${verified}/${total} verified saved for offline`;
     // Left visible (not auto-hidden) once complete -- that confirmation is
     // exactly the reassurance needed before someone disconnects to go
     // offline, so it shouldn't disappear or get silently overwritten.
