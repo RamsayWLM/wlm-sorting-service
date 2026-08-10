@@ -964,6 +964,22 @@
 <script>
 const $ = id => document.getElementById(id);
 
+// These two must be declared before anything else in this script: api()
+// (defined below, but callable as early as initFolders()'s page-load call,
+// well before this file's own "offline queue" section further down) reads
+// _isOffline on every call. A `let` isn't accessible until its own
+// declaration line actually runs, even though the *function* referencing
+// it is hoisted — calling api() before this ran threw a silently-caught
+// "Cannot access '_isOffline' before initialization" ReferenceError inside
+// initFolders()'s try/catch, which is why the folder sidebar could come up
+// completely empty after a hard refresh with no visible error anywhere.
+let _offlineQueue = [];
+try { _offlineQueue = JSON.parse(localStorage.getItem('wlm-offline-queue') || '[]'); } catch(e) {}
+// If the page was closed/refreshed before a previous offline session ever
+// reconciled, treat this load as still "offline" so the first successful
+// stats poll naturally triggers the reconnect prompt for the leftover queue.
+let _isOffline = _offlineQueue.length > 0;
+
 const PAGE_SIZE  = 150;
 const LABEL_CLASSES = { red:'lc-red', yellow:'lc-yellow', green:'lc-green', blue:'lc-blue', purple:'lc-purple', none:'lc-none' };
 
@@ -5107,12 +5123,6 @@ function dismissCacheToast() {
 // back — with a confirmation prompt listing exactly what will be applied,
 // since these are real files on the client's disk, not database rows that
 // can be blindly replayed.
-let _offlineQueue = [];
-try { _offlineQueue = JSON.parse(localStorage.getItem('wlm-offline-queue') || '[]'); } catch(e) {}
-// If the page was closed/refreshed before a previous offline session ever
-// reconciled, treat this load as still "offline" so the first successful
-// stats poll naturally triggers the reconnect prompt for the leftover queue.
-let _isOffline = _offlineQueue.length > 0;
 if (_isOffline) document.addEventListener('DOMContentLoaded', () => _updateOfflineBanner());
 
 function _saveOfflineQueue() {
