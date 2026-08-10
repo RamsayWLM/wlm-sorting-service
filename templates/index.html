@@ -1038,6 +1038,15 @@ async function _idbGet(storeName, key) {
 }
 
 async function api(url) {
+  // If we already know we're offline (the periodic health-check already
+  // failed), don't spend up to 6s re-discovering that on every single
+  // folder click before falling back — go straight to the stored copy.
+  // Still falls through to a live attempt below if nothing's stored,
+  // in case we're actually back online and just haven't polled yet.
+  if (_isOffline) {
+    const cached = await _idbGet('listings', url).catch(() => undefined);
+    if (cached !== undefined) return cached;
+  }
   let r;
   try {
     r = await _fetchWithTimeout(url, {}, 6000);
@@ -2501,6 +2510,17 @@ function _initImgLoading(container) {
     };
     if (img.complete) {
       _markLoaded();
+      return;
+    }
+
+    // Already known offline (the source attribute set a moment ago already
+    // kicked off a live request that's guaranteed to fail) -- don't wait on
+    // it at all, go straight to the stored copy. With dozens of images per
+    // folder, even a short per-image wait multiplies into a very sluggish
+    // "offline but everything still visually loads eventually" feeling.
+    if (_isOffline) {
+      img.src = '';
+      _imgOfflineFallback(img);
       return;
     }
 
@@ -5162,18 +5182,35 @@ function _setOffline(val) {
 }
 
 function _showReconnectPrompt() {
-  const lines = _offlineQueue.map(a => '• ' + _describeOfflineAction(a)).join('\n');
-  const proceed = confirm(
-    `Connection restored. Apply the following ${_offlineQueue.length} change${_offlineQueue.length !== 1 ? 's' : ''} made while offline?\n\n${lines}`
-  );
-  if (!proceed) {
+  const esc = s => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  const items = _offlineQueue.map(a => `<li style="margin-bottom:5px">${esc(_describeOfflineAction(a))}</li>`).join('');
+  const overlay = document.createElement('div');
+  overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.75);z-index:3000;display:flex;align-items:center;justify-content:center';
+  overlay.innerHTML = `
+    <div style="background:#1a1a1a;border:1px solid #333;border-radius:10px;padding:24px;width:420px;max-height:70vh;display:flex;flex-direction:column">
+      <div style="font-weight:600;font-size:15px;margin-bottom:6px;color:#e0e0e0">Connection restored</div>
+      <div style="font-size:12px;color:var(--muted);margin-bottom:12px">
+        Apply the following ${_offlineQueue.length} change${_offlineQueue.length !== 1 ? 's' : ''} made while offline?
+      </div>
+      <ul style="font-size:12px;color:#c8c8c8;margin:0 0 18px;padding-left:18px;overflow-y:auto;flex:1">${items}</ul>
+      <div style="display:flex;gap:10px;justify-content:flex-end">
+        <button id="_reconnectStopBtn" style="background:#333;border:none;color:#e0e0e0;border-radius:6px;padding:9px 14px;cursor:pointer;font-size:13px">Stop: Don't move files</button>
+        <button id="_reconnectApplyBtn" style="background:#d4a017;border:none;color:#181818;font-weight:700;border-radius:6px;padding:9px 14px;cursor:pointer;font-size:13px">Apply changes</button>
+      </div>
+    </div>`;
+  document.body.appendChild(overlay);
+
+  overlay.querySelector('#_reconnectStopBtn').addEventListener('click', () => {
+    overlay.remove();
     _offlineQueue = [];
     _saveOfflineQueue();
     _updateOfflineBanner();
     $('statusLeft').textContent = 'Offline changes discarded — refresh to see the current folder state.';
-    return;
-  }
-  _replayOfflineQueue();
+  });
+  overlay.querySelector('#_reconnectApplyBtn').addEventListener('click', () => {
+    overlay.remove();
+    _replayOfflineQueue();
+  });
 }
 
 async function _replayOfflineQueue() {
