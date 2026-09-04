@@ -19,22 +19,36 @@ iCloud Drive, ...) the moment it's scanned, instead of once for the one
 folder the client actually agreed to.
 """
 import atexit
+import hashlib
 import json
 import os
+import re
 import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import tkinter as tk
+import urllib.error
+import urllib.request
 import webbrowser
+import zipfile
 from pathlib import Path
 from tkinter import filedialog, messagebox
 
 from PIL import Image, ImageTk
 
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.1.0"
+
+# Public GitHub repo hosting release builds for self-update -- no auth token
+# needed for the unauthenticated "latest release" read, at the cost of the
+# built app being publicly downloadable. Revisit (private repo + a
+# read-only, this-repo-only token) before this goes to a real paying
+# client; fine while this is WLM's own team + friend-testing.
+UPDATE_REPO = "RamsayWLM/wlm-sorting-service"
+UPDATE_CHECK_INTERVAL = 3600  # seconds
 
 
 def _bundle_dir() -> Path:
@@ -165,6 +179,112 @@ def _restart_app():
     else:
         subprocess.Popen([sys.executable, os.path.abspath(__file__)])
     os._exit(0)
+
+
+def _parse_version(v: str):
+    """'v1.2.3' or '1.2.3' -> (1, 2, 3), for tuple comparison. Falls back to
+    (0,) on anything unparseable so a malformed remote tag can never crash
+    the check -- it just reads as "no update available" instead."""
+    try:
+        return tuple(int(p) for p in v.lstrip('vV').split('.'))
+    except Exception:
+        return (0,)
+
+
+def _check_and_apply_update():
+    """Checks UPDATE_REPO's latest GitHub release against APP_VERSION and,
+    if newer, downloads + verifies + installs it, then relaunches through
+    the same process-handoff _restart_app() already uses for Change
+    Folder/Restart Service. Runs unattended on a timer -- the client never
+    sees or does anything; this is the entire point, since a client should
+    never need to be talked through reinstalling the app to get a fix.
+
+    Every failure path below just leaves the current version running --
+    never a half-updated install. The checksum check specifically exists so
+    a corrupted download, or a compromised/spoofed release, can never get
+    installed and run unattended on a client's own machine: this only
+    installs a build whose SHA-256 matches what the release notes declare.
+    """
+    if not getattr(sys, 'frozen', False):
+        return  # nothing to swap in dev mode -- there's no .app bundle
+    try:
+        req = urllib.request.Request(
+            f'https://api.github.com/repos/{UPDATE_REPO}/releases/latest',
+            headers={'User-Agent': 'wlm-sorting-service-updater', 'Accept': 'application/vnd.github+json'},
+        )
+        with urllib.request.urlopen(req, timeout=15) as r:
+            release = json.loads(r.read())
+
+        remote_version = release.get('tag_name', '')
+        if _parse_version(remote_version) <= _parse_version(APP_VERSION):
+            return  # already current (or the tag is malformed -- do nothing either way)
+
+        zip_asset = next((a for a in release.get('assets', []) if a['name'].endswith('.zip')), None)
+        if not zip_asset:
+            return
+
+        checksum_match = re.search(r'sha256:\s*([0-9a-fA-F]{64})', release.get('body') or '', re.IGNORECASE)
+        if not checksum_match:
+            print(f"[update] {remote_version} has no sha256 in its release notes -- refusing to install unverified.", flush=True)
+            return
+        expected_sha256 = checksum_match.group(1).lower()
+
+        print(f"[update] {APP_VERSION} -> {remote_version}: downloading {zip_asset['name']}...", flush=True)
+        with tempfile.TemporaryDirectory() as tmp:
+            zip_path = Path(tmp) / 'update.zip'
+            urllib.request.urlretrieve(zip_asset['browser_download_url'], zip_path)
+
+            actual_sha256 = hashlib.sha256(zip_path.read_bytes()).hexdigest()
+            if actual_sha256 != expected_sha256:
+                print(f"[update] Checksum mismatch (got {actual_sha256}, expected {expected_sha256}) -- aborting.", flush=True)
+                return
+
+            extract_dir = Path(tmp) / 'extracted'
+            with zipfile.ZipFile(zip_path) as z:
+                z.extractall(extract_dir)
+            new_app = next(extract_dir.glob('*.app'), None)
+            if not new_app:
+                print("[update] Release zip has no .app bundle inside -- aborting.", flush=True)
+                return
+
+            current_app = Path(sys.executable).resolve().parents[2]
+            staged = current_app.with_name(current_app.name + '.new')
+            old = current_app.with_name(current_app.name + '.old')
+            if staged.exists():
+                shutil.rmtree(staged, ignore_errors=True)
+            shutil.copytree(new_app, staged)
+
+            # Rename-swap rather than overwriting the running bundle's own
+            # files in place: this process's already-open executable stays
+            # valid even after its path is renamed out from under it (macOS
+            # keeps it backed by the underlying inode), and if anything goes
+            # wrong between these two renames, current_app is briefly
+            # missing rather than left half-overwritten -- a narrower,
+            # safer failure window, for a point by which nothing above has
+            # thrown anyway.
+            if old.exists():
+                shutil.rmtree(old, ignore_errors=True)
+            current_app.rename(old)
+            staged.rename(current_app)
+            shutil.rmtree(old, ignore_errors=True)
+
+        print(f"[update] Installed {remote_version} -- relaunching.", flush=True)
+        _restart_app()
+    except Exception as e:
+        print(f"[update] Check/install failed, staying on {APP_VERSION}: {e}", flush=True)
+
+
+def _run_update_watcher(shell):
+    """Background loop, started alongside the cert-renewal watcher: checks
+    shortly after launch (a fix sent out today shouldn't need up to an hour
+    to reach a client who relaunches this morning) and hourly after that."""
+    time.sleep(60)
+    while not shell._stopped:
+        _check_and_apply_update()
+        for _ in range(UPDATE_CHECK_INTERVAL // 5):
+            if shell._stopped:
+                return
+            time.sleep(5)
 
 
 LAUNCH_AGENT_LABEL = "com.whitelightsmedia.wlmsortingservice"
@@ -485,6 +605,7 @@ class ServiceShell:
         _import_server_app(folder)
         threading.Thread(target=self._run_server, daemon=True).start()
         threading.Thread(target=self._run_cert_renewal_watcher, daemon=True).start()
+        threading.Thread(target=_run_update_watcher, args=(self,), daemon=True).start()
         self._update_stats()
 
     def _run_cert_renewal_watcher(self):
