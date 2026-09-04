@@ -151,6 +151,8 @@
   .folder-item.multi-sel .f-name { color: #cfe4f7; }
   .folder-item.drop-target { background: rgba(30,58,90,0.85) !important; outline: 2px solid var(--gold) !important; outline-offset: -2px; }
   .folder-item.search-highlight { background: var(--sel-bg); outline: 1px solid var(--sel-bdr); outline-offset: -1px; }
+  .folder-item.folder-pending-offline { opacity: 0.6; }
+  .pending-hourglass { font-size: 10px; opacity: 0.8; }
 
   /* ── Stats ── */
   .stats-lbl {
@@ -1575,10 +1577,23 @@ function createFolderEl(f, fullPath, indentPx) {
     ? `<span class="f-chevron">▸</span>`
     : `<span style="width:8px;flex-shrink:0"></span>`;
   el.innerHTML = `${chevron}<span class="f-name"><span class="f-name-text">${f.name}</span></span><span class="f-cache-dot" title=""></span><span class="f-count"></span>`;
+  // A folder created while offline (queued, not yet real on the server) --
+  // still a full folder-item (draggable, a drop target, clickable) so you
+  // can carry on sorting into it immediately, just visually marked as not
+  // real yet. Replaced by the authoritative one once the reconnect replay
+  // refreshes this parent.
+  if (f._pendingOffline) {
+    el.classList.add('folder-pending-offline');
+    el.title = 'Will be created once back online';
+    const nameEl = el.querySelector('.f-name-text');
+    if (nameEl) nameEl.insertAdjacentHTML('afterend', ' <span class="pending-hourglass">⏳</span>');
+  }
   applyFolderColor(el, f.name, fullPath);
   applyFolderCacheDot(el, fullPath);
   // Apply cached count directly to the element (not yet in DOM, so can't use querySelectorAll)
-  if (_countCache[fullPath] !== undefined) {
+  if (f._pendingOffline) {
+    // skip -- nothing to count on the server for a folder that doesn't exist there yet
+  } else if (_countCache[fullPath] !== undefined) {
     const counts = _countCache[fullPath];
     const cEl = el.querySelector('.f-count');
     if (cEl) {
@@ -1712,7 +1727,7 @@ async function toggleFolder(path, el, childIndentPx) {
     const children = await api(`/api/ls/${encPath(path)}`);
     const wrap = document.createElement('div');
     wrap.dataset.childof = path;
-    children.forEach(c => {
+    children.concat(_pendingMkdirChildren(path)).forEach(c => {
       wrap.appendChild(createFolderEl(c, `${path}/${c.name}`, childIndentPx));
     });
     el.insertAdjacentElement('afterend', wrap);
@@ -1721,6 +1736,23 @@ async function toggleFolder(path, el, childIndentPx) {
     expandedFolders.delete(path);
     if (chevron) chevron.textContent = '▸';
   }
+}
+
+// Folders queued offline (via "New folder") don't exist on the server yet,
+// so they'd otherwise be invisible every time this parent's contents get
+// (re-)rendered -- expanding, collapsing and re-expanding, or a from-scratch
+// offline reload. Synthesizing them here, at the one place real children get
+// rendered for a parent, means every one of those paths shows the pending
+// folder correctly without needing its own separate rendering logic.
+function _pendingMkdirChildren(parentPath) {
+  const out = [];
+  for (const action of _offlineQueue) {
+    if (action.kind !== 'mkdir' || action.body.parent !== parentPath) continue;
+    for (const name of (action.body.names || [])) {
+      out.push({ name, hasChildren: false, _pendingOffline: true });
+    }
+  }
+  return out;
 }
 
 function _saveExpandedFolders() {
@@ -3115,7 +3147,12 @@ async function _applyRatingUpdate(indices, {rating, flag}) {
   const body = {paths};
   if (rating !== undefined) body.rating = rating;
   if (flag   !== undefined) body.flag   = flag;
-  try { await fetch('/api/rate', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)}); } catch(e) {}
+  // UI above already updated optimistically regardless of connection state
+  // (that part isn't new) -- what was missing was the request itself: a
+  // plain fire-and-forget fetch meant a rating/flag set while offline was
+  // just silently lost forever the moment the tab closed, with the star
+  // shown on screen never having actually been anything but local.
+  try { await _sendOrQueue('rate', '/api/rate', body); } catch(e) {}
 }
 
 function rateSelected(n) {
@@ -3674,15 +3711,13 @@ async function submitMkdir() {
   btn.disabled = true;
   btn.textContent = 'Creating…';
   try {
-    const res = await fetch('/api/mkdir', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ parent: savedTarget, names })
-    });
+    const res = await _sendOrQueue('mkdir', '/api/mkdir', { parent: savedTarget, names });
     const data = await res.json();
     const n = (data.created || []).length;
     const errs = (data.errors || []).length;
-    $('statusLeft').textContent = `Created ${n} folder${n !== 1 ? 's' : ''}${errs ? `, ${errs} failed` : ''} in ${savedTarget.split('/').pop()}`;
+    $('statusLeft').textContent = _isOffline
+      ? `Queued: ${n} folder${n !== 1 ? 's' : ''} in ${savedTarget.split('/').pop()} (offline — will apply when reconnected)`
+      : `Created ${n} folder${n !== 1 ? 's' : ''}${errs ? `, ${errs} failed` : ''} in ${savedTarget.split('/').pop()}`;
     closeMkdir();
     // Refresh just the target folder in the sidebar (collapse then re-expand)
     const el = document.querySelector(`.folder-item[data-path="${CSS.escape(savedTarget)}"]`);
@@ -3728,22 +3763,20 @@ async function submitDelete() {
   const { type, paths } = _deletePayload;
   closeDeleteConfirm();
   try {
-    const res = await fetch('/api/delete', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ paths, folder: type === 'folder' })
-    });
+    const res = await _sendOrQueue('delete', '/api/delete', { paths, folder: type === 'folder' });
     const data = await res.json();
     const deletedSet = new Set(data.deleted || []);
     const n = deletedSet.size;
     const errs = (data.errors || []).length;
-    if (n === 0) {
+    if (n === 0 && !_isOffline) {
       $('statusLeft').textContent = errs
         ? `Delete failed — check NAS permissions (may need to delete from File Station as admin)`
         : `Nothing deleted`;
       return;
     }
-    $('statusLeft').textContent = `Deleted ${n} item${n !== 1 ? 's' : ''}${errs ? ` (${errs} failed)` : ''}`;
+    $('statusLeft').textContent = _isOffline
+      ? `Queued: ${n} item${n !== 1 ? 's' : ''} will be deleted when reconnected`
+      : `Deleted ${n} item${n !== 1 ? 's' : ''}${errs ? ` (${errs} failed)` : ''}`;
     if (type === 'folder') {
       // Only remove from sidebar what was actually deleted
       [...deletedSet].forEach(p => {
@@ -5244,6 +5277,24 @@ function _describeOfflineAction(action) {
   if (action.kind === 'rename') {
     return `"${(action.body.path || '').split('/').pop()}" renamed to "${action.body.name}"`;
   }
+  if (action.kind === 'mkdir') {
+    const names = action.body.names || [];
+    const into = (action.body.parent || '').split('/').pop() || 'top level';
+    return names.length === 1
+      ? `Folder "${names[0]}" created in "${into}"`
+      : `${names.length} folders created in "${into}"`;
+  }
+  if (action.kind === 'delete') {
+    const n = (action.body.paths || []).length;
+    return `${n} ${action.body.folder ? 'folder' : 'file'}${n !== 1 ? 's' : ''} deleted`;
+  }
+  if (action.kind === 'rate') {
+    const n = (action.body.paths || []).length;
+    const parts = [];
+    if (action.body.rating !== undefined) parts.push(`rated ${action.body.rating}★`);
+    if (action.body.flag !== undefined) parts.push(`flagged ${action.body.flag}`);
+    return `${n} file${n !== 1 ? 's' : ''} ${parts.join(', ') || 'updated'}`;
+  }
   if (action.kind === 'move-folder') {
     return `Folder "${(action.body.src || '').split('/').pop()}" moved into "${(action.body.dest || '').split('/').pop() || 'top level'}"`;
   }
@@ -5385,6 +5436,36 @@ async function _refreshOfflineSnapshotAfterMove(kind, bodyObj) {
     affected = [bodyObj.dest || '', parentOf(bodyObj.src || '')];
   } else if (kind === 'rename') {
     affected = [parentOf(bodyObj.path || '')];
+  } else if (kind === 'mkdir') {
+    // A new subfolder changes its parent's *tree* listing (/api/ls), not a
+    // photos-in listing -- refresh that cache key specifically, then return;
+    // there's no thumbnail work to do for a folder that has no files yet.
+    const url = `/api/ls/${encPath(bodyObj.parent || '')}`;
+    const had = await _idbGet('listings', url).catch(() => undefined);
+    if (had !== undefined) {
+      try {
+        const resp = await fetch(url);
+        if (resp.ok) await _idbPut('listings', url, await resp.json());
+      } catch (e) {}
+    }
+    return;
+  } else if (kind === 'delete') {
+    // Same tree-listing refresh as mkdir when a folder was deleted (its
+    // parent's tree changed); a file delete instead affects the parent's
+    // photos-in listing, handled by the loop below like any other move.
+    if (bodyObj.folder) {
+      for (const p of (bodyObj.paths || [])) {
+        const url = `/api/ls/${encPath(parentOf(p))}`;
+        const had = await _idbGet('listings', url).catch(() => undefined);
+        if (had === undefined) continue;
+        try {
+          const resp = await fetch(url);
+          if (resp.ok) await _idbPut('listings', url, await resp.json());
+        } catch (e) {}
+      }
+      return;
+    }
+    affected = [...new Set((bodyObj.paths || []).map(parentOf))];
   }
   for (const folder of new Set(affected)) {
     const url = `/api/photos-in/${encPath(folder)}`;
@@ -5464,6 +5545,9 @@ function _showReplaySummary({ kindCounts, filesMoved, filesSkipped, skipReasonCo
   if (filesMoved) appliedParts.push(`${filesMoved.toLocaleString()} file${filesMoved !== 1 ? 's' : ''} moved`);
   if (kindCounts.rename) appliedParts.push(`${kindCounts.rename} rename${kindCounts.rename !== 1 ? 's' : ''}`);
   if (kindCounts['move-folder']) appliedParts.push(`${kindCounts['move-folder']} folder move${kindCounts['move-folder'] !== 1 ? 's' : ''}`);
+  if (kindCounts.mkdir) appliedParts.push(`${kindCounts.mkdir} new folder${kindCounts.mkdir !== 1 ? 's' : ''}`);
+  if (kindCounts.delete) appliedParts.push(`${kindCounts.delete} delete action${kindCounts.delete !== 1 ? 's' : ''}`);
+  if (kindCounts.rate) appliedParts.push(`${kindCounts.rate} rating/flag update${kindCounts.rate !== 1 ? 's' : ''}`);
   const appliedLine = appliedParts.length ? `Applied: ${appliedParts.join(', ')}.` : 'Nothing was applied.';
 
   const skipLine = filesSkipped
@@ -5538,6 +5622,8 @@ async function _sendOrQueue(kind, url, bodyObj) {
   if (kind === 'move-folder') {
     fake.new_path = (bodyObj.dest ? bodyObj.dest + '/' : '') + bodyObj.src.split('/').pop();
   }
+  if (kind === 'mkdir') { fake.created = bodyObj.names; fake.errors = []; }
+  if (kind === 'delete') { fake.deleted = bodyObj.paths; fake.errors = []; }
   return new Response(JSON.stringify(fake), { status: 200 });
 }
 
