@@ -40,7 +40,7 @@ from tkinter import filedialog, messagebox
 
 from PIL import Image, ImageTk
 
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.3.0"
 
 # Public GitHub repo hosting release builds for self-update -- no auth token
 # needed for the unauthenticated "latest release" read, at the cost of the

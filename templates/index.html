@@ -1037,6 +1037,17 @@ const OFFLINE_DB_NAME = 'wlm-offline-db';
 const OFFLINE_DB_VERSION = 1;
 let _offlineDbPromise = null;
 
+// Without this, the whole offline store is "best-effort" from the browser's
+// point of view -- it's free to evict it under disk pressure with no warning
+// at all, which is a strong candidate for past "I cached this and it's empty
+// now" reports that could never be reproduced. persist() asks the browser
+// not to do that; it can still say no (mainly Safari, and only sometimes
+// Chrome without the page being bookmarked/installed), but asking costs
+// nothing and this is a fire-and-forget best-effort call either way.
+if (navigator.storage?.persist) {
+  navigator.storage.persist().catch(() => {});
+}
+
 function _openOfflineDb() {
   if (_offlineDbPromise) return _offlineDbPromise;
   _offlineDbPromise = new Promise((resolve, reject) => {
@@ -5957,6 +5968,41 @@ async function downloadSelected() {
 
 // ── Cache manager modal (NAS totals, browser totals, per-folder watch list) ───
 
+// The "Browser cache" panel below this predates real offline support and
+// only ever tracked the browser's own *opportunistic* HTTP image cache
+// (informational, browser-managed, nothing to meaningfully "clear" beyond
+// resetting that tracking). It has never had anything to do with
+// wlm-offline-db -- the actual IndexedDB store that "Cache thumbnails" /
+// prefetchFolderThumbs fills and that offline mode is genuinely built on --
+// so there was no way to see its size or clear it at all. navigator.storage
+// .estimate() gives a fast, honest-enough proxy for its size (this origin's
+// total usage, which this store dominates) without walking every blob.
+async function _offlineDataStats() {
+  try {
+    if (!navigator.storage?.estimate) return { supported: false };
+    const est = await navigator.storage.estimate();
+    return { supported: true, bytes: est.usage || 0, quotaBytes: est.quota || 0 };
+  } catch (e) {
+    return { supported: false };
+  }
+}
+
+async function _clearOfflineData() {
+  // Drop the in-memory connection first -- indexedDB.deleteDatabase() blocks
+  // (fires 'blocked', not 'success') for as long as any open connection to
+  // it exists, including this page's own.
+  if (_offlineDbPromise) {
+    try { (await _offlineDbPromise).close(); } catch (e) {}
+  }
+  _offlineDbPromise = null;
+  await new Promise((resolve) => {
+    const req = indexedDB.deleteDatabase(OFFLINE_DB_NAME);
+    req.onsuccess = resolve;
+    req.onerror = resolve;
+    req.onblocked = resolve;
+  });
+}
+
 async function openCacheManager() {
   let data = { cached: [] };
   let server_path = '';
@@ -6023,6 +6069,12 @@ async function openCacheManager() {
         </div>
       </div>
 
+      <div style="margin-bottom:16px">
+        <div style="font-size:10px;color:#888;margin-bottom:4px">Offline data — for viewing without a connection (this device)</div>
+        <div id="_offlineDataStat" style="font-family:monospace;font-size:11px;background:#111;padding:8px;border-radius:5px;margin-bottom:6px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">loading…</div>
+        <button id="_offlineDataClearBtn" style="width:100%;padding:6px;background:rgba(200,50,50,0.1);border:1px solid rgba(200,50,50,0.25);color:#b05050;border-radius:5px;cursor:pointer;font-size:11px">🗑 Clear offline data</button>
+      </div>
+
       <div style="font-size:10px;color:var(--muted);margin-bottom:8px">
         ${cached.length} watched folder${cached.length !== 1 ? 's' : ''} &nbsp;·&nbsp;
         ${totalCount} thumbnails &nbsp;·&nbsp;
@@ -6043,6 +6095,7 @@ async function openCacheManager() {
 
   const nasStatEl = overlay.querySelector('#_nasCacheStat');
   const brStatEl  = overlay.querySelector('#_browserCacheStat');
+  const offStatEl = overlay.querySelector('#_offlineDataStat');
 
   async function refreshNasStat() {
     try {
@@ -6061,13 +6114,20 @@ async function openCacheManager() {
       brStatEl.textContent = `${total.toLocaleString()} thumbs · ${_fmtBytes(bytes)}${approx}`;
     }
   }
+  async function refreshOfflineDataStat() {
+    const { supported, bytes, quotaBytes } = await _offlineDataStats();
+    offStatEl.textContent = supported
+      ? `${_fmtBytes(bytes)} used${quotaBytes ? ` of ${_fmtBytes(quotaBytes)} available` : ''}`
+      : 'not supported in this browser';
+  }
 
   refreshNasStat();
   refreshBrowserStat();
+  refreshOfflineDataStat();
   // Backfill real sizes for every NAS-cached folder (not just ones you've browsed this
   // session) so the estimate above is accurate right away, not just "size unknown".
   Promise.all(cached.map(c => _backfillThumbSizes(c.folder))).then(refreshBrowserStat);
-  const liveTimer = setInterval(() => { refreshNasStat(); refreshBrowserStat(); }, 3000);
+  const liveTimer = setInterval(() => { refreshNasStat(); refreshBrowserStat(); refreshOfflineDataStat(); }, 3000);
   const stopLive = () => clearInterval(liveTimer);
 
   overlay.addEventListener('click', e => { if (e.target === overlay) { stopLive(); overlay.remove(); } });
@@ -6094,6 +6154,20 @@ async function openCacheManager() {
     refreshBrowserStat();
     this.textContent = 'Cleared!';
     setTimeout(() => { this.textContent = '🗑 Clear browser tracking'; }, 1500);
+  });
+
+  overlay.querySelector('#_offlineDataClearBtn').addEventListener('click', async function() {
+    if (_offlineQueue.length) {
+      alert(`You have ${_offlineQueue.length} change${_offlineQueue.length !== 1 ? 's' : ''} waiting to apply once back online -- clearing offline data now would not lose those (they're stored separately), but do this once you're back online and they've been applied, not before.`);
+      return;
+    }
+    if (!confirm('Clear everything saved for offline viewing on this device? Folders you\'ve prepared with "Cache thumbnails" will no longer be viewable without a connection until you cache them again.')) return;
+    this.disabled = true; this.textContent = 'Clearing…';
+    await _clearOfflineData();
+    await refreshOfflineDataStat();
+    this.disabled = false;
+    this.textContent = 'Cleared!';
+    setTimeout(() => { this.textContent = '🗑 Clear offline data'; }, 1500);
   });
 
   overlay.querySelector('#_cacheCopyBtn').addEventListener('click', function() {
