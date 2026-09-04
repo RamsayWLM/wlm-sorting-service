@@ -276,6 +276,15 @@ class ServiceShell:
             self._build_setup_screen()
 
     def _clear(self):
+        # The setup screen binds a window-wide mousewheel handler (see
+        # _build_setup_screen) since it's the one screen whose content can
+        # run longer than the window -- unbind it on every screen change so
+        # it doesn't outlive the canvas it was scrolling, and so a later
+        # screen doesn't have mousewheel events silently swallowed by it.
+        try:
+            self.root.unbind_all("<MouseWheel>")
+        except Exception:
+            pass
         for w in self.root.winfo_children():
             w.destroy()
 
@@ -303,51 +312,87 @@ class ServiceShell:
         self.root.geometry("440x660")
         pad = {'padx': 24}
 
+        # This screen's content (logo + a 5-step instruction block + the
+        # folder picker + Done) was hitting a real bug on a real client
+        # machine: at a fixed 440x660 with resizable(False, False), a
+        # client with slightly larger system text or a different display
+        # scale than whatever this was last tuned against pushed the Done
+        # button below the window's visible/clickable area entirely, with
+        # no way to reach it -- not a hang, just permanently invisible.
+        # A scrollable canvas means that can never happen again regardless
+        # of any client's font size, resolution, or how long this text
+        # grows in a future edit: everything below the fold is still
+        # reachable, just a scroll away, instead of silently unreachable.
+        outer = tk.Frame(self.root, bg=_COL_BG)
+        outer.pack(fill='both', expand=True)
+        canvas = tk.Canvas(outer, bg=_COL_BG, highlightthickness=0)
+        scrollbar = tk.Scrollbar(outer, orient='vertical', command=canvas.yview)
+        canvas.configure(yscrollcommand=scrollbar.set)
+        scrollbar.pack(side='right', fill='y')
+        canvas.pack(side='left', fill='both', expand=True)
+
+        root = tk.Frame(canvas, bg=_COL_BG)  # everything below packs into this, not self.root
+        window_id = canvas.create_window((0, 0), window=root, anchor='nw')
+        root.bind('<Configure>', lambda e: canvas.configure(scrollregion=canvas.bbox('all')))
+        # Keep the inner frame exactly as wide as the canvas viewport so text
+        # wraps the same as it would in a plain (non-scrolling) window --
+        # otherwise it defaults to its own natural width and never wraps.
+        canvas.bind('<Configure>', lambda e: canvas.itemconfig(window_id, width=e.width))
+        # macOS reports trackpad/wheel scroll as <MouseWheel>; bound on the
+        # whole app rather than just the canvas because Tkinter delivers the
+        # event to whatever's under the pointer (a label or button inside
+        # `root`), not to the canvas underneath it. _clear() unbinds this on
+        # every screen change so it doesn't leak into whichever screen comes
+        # after setup.
+        self.root.bind_all(
+            '<MouseWheel>', lambda e: canvas.yview_scroll(int(-1 * e.delta), 'units')
+        )
+
         logo = self._logo_image(240)
         if logo:
-            tk.Label(self.root, image=logo, bg=_COL_BG).pack(pady=(28, 16))
+            tk.Label(root, image=logo, bg=_COL_BG).pack(pady=(28, 16))
         else:
             tk.Label(
-                self.root, text="Welcome to the WLM Sorting Service", fg=_COL_FG, bg=_COL_BG,
+                root, text="Welcome to the WLM Sorting Service", fg=_COL_FG, bg=_COL_BG,
                 font=("-apple-system", 15, "bold"), wraplength=390, justify="left",
             ).pack(pady=(24, 12), **pad)
 
         tk.Label(
-            self.root, text=SETUP_STEPS_TEXT, fg="#c8c8c8", bg=_COL_BG,
+            root, text=SETUP_STEPS_TEXT, fg="#c8c8c8", bg=_COL_BG,
             font=("-apple-system", 12), wraplength=390, justify="left",
         ).pack(pady=(0, 14), **pad)
 
         _make_button(
-            self.root, "Open Tailscale download page",
+            root, "Open Tailscale download page",
             lambda: webbrowser.open('https://tailscale.com/download'),
             bg=_COL_BTN, fg=_COL_BTN_FG,
         ).pack(pady=(0, 10), **pad)
 
         _make_button(
-            self.root, "Open Tailscale admin console (for step 3)",
+            root, "Open Tailscale admin console (for step 3)",
             lambda: webbrowser.open('https://login.tailscale.com/admin/dns'),
             bg=_COL_BTN, fg=_COL_BTN_FG,
         ).pack(pady=(0, 20), **pad)
 
-        tk.Frame(self.root, bg="#333", height=1).pack(fill='x', **pad)
+        tk.Frame(root, bg="#333", height=1).pack(fill='x', **pad)
 
         tk.Label(
-            self.root, text="Choose the folder for White Lights Media to work in:",
+            root, text="Choose the folder for White Lights Media to work in:",
             fg=_COL_FG, bg=_COL_BG, font=("-apple-system", 12, "bold"),
             wraplength=390, justify="left",
         ).pack(pady=(20, 6), **pad)
 
         tk.Label(
-            self.root, textvariable=self._chosen_folder, fg=_COL_ACCENT, bg=_COL_BG,
+            root, textvariable=self._chosen_folder, fg=_COL_ACCENT, bg=_COL_BG,
             font=("-apple-system", 11), wraplength=390, justify="left",
         ).pack(pady=(0, 14), **pad)
 
         _make_button(
-            self.root, "Browse...", self._on_browse, bg=_COL_BTN, fg=_COL_BTN_FG,
+            root, "Browse...", self._on_browse, bg=_COL_BTN, fg=_COL_BTN_FG,
         ).pack(pady=(0, 16), **pad)
 
         tk.Checkbutton(
-            self.root, text="Launch automatically when this Mac starts (recommended)",
+            root, text="Launch automatically when this Mac starts (recommended)",
             variable=self._launch_at_login_var, fg=_COL_FG, bg=_COL_BG,
             selectcolor=_COL_BTN, activebackground=_COL_BG, activeforeground=_COL_FG,
             font=("-apple-system", 11), wraplength=390, justify="left",
@@ -355,7 +400,7 @@ class ServiceShell:
         ).pack(pady=(0, 16), **pad)
 
         self._done_btn = _make_button(
-            self.root, "Done", self._on_setup_done, bg=_COL_BTN_DISABLED, fg=_COL_FG_DIM, bold=True,
+            root, "Done", self._on_setup_done, bg=_COL_BTN_DISABLED, fg=_COL_FG_DIM, bold=True,
         )
         self._done_btn.unbind("<Button-1>")
         self._done_btn.configure(cursor="arrow")
