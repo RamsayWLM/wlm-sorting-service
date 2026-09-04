@@ -5400,12 +5400,34 @@ function _showReconnectPrompt() {
         Apply the following ${_offlineQueue.length} change${_offlineQueue.length !== 1 ? 's' : ''} made while offline?
       </div>
       <ul style="font-size:12px;color:#c8c8c8;margin:0 0 18px;padding-left:18px;overflow-y:auto;flex:1">${items}</ul>
-      <div style="display:flex;gap:10px;justify-content:flex-end">
-        <button id="_reconnectStopBtn" style="background:#333;border:none;color:#e0e0e0;border-radius:6px;padding:9px 14px;cursor:pointer;font-size:13px">Stop: Don't move files</button>
-        <button id="_reconnectApplyBtn" style="background:#d4a017;border:none;color:#181818;font-weight:700;border-radius:6px;padding:9px 14px;cursor:pointer;font-size:13px">Apply changes</button>
+      <div style="display:flex;gap:10px;justify-content:space-between;align-items:center">
+        <button id="_reconnectExportBtn" style="background:none;border:none;color:var(--muted);text-decoration:underline;cursor:pointer;font-size:11px;padding:0">Export list to a file</button>
+        <div style="display:flex;gap:10px">
+          <button id="_reconnectStopBtn" style="background:#333;border:none;color:#e0e0e0;border-radius:6px;padding:9px 14px;cursor:pointer;font-size:13px">Stop: Don't move files</button>
+          <button id="_reconnectApplyBtn" style="background:#d4a017;border:none;color:#181818;font-weight:700;border-radius:6px;padding:9px 14px;cursor:pointer;font-size:13px">Apply changes</button>
+        </div>
       </div>
     </div>`;
   document.body.appendChild(overlay);
+
+  // A last-ditch escape hatch, not a normal step: if a replay of a large
+  // queue ever goes sideways (a bad server response, a bug, whatever), this
+  // is the one copy of "what was about to happen" that exists anywhere
+  // outside this in-memory dialog once Apply is clicked -- worth having on
+  // disk before committing to either button below, not just for very large
+  // queues.
+  overlay.querySelector('#_reconnectExportBtn').addEventListener('click', () => {
+    const lines = _offlineQueue.map(a => `${new Date(a.ts).toLocaleString()}\t${a.kind}\t${_describeOfflineAction(a)}`);
+    const blob = new Blob([lines.join('\n')], { type: 'text/plain' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `wlm-offline-changes-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-')}.txt`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  });
 
   overlay.querySelector('#_reconnectStopBtn').addEventListener('click', () => {
     overlay.remove();
@@ -5568,15 +5590,34 @@ function _skipReasonLabel(reason) {
   return reason || 'unknown reason';
 }
 
+// Mutable state a running replay checks between actions -- set by the
+// Cancel button in the progress overlay below. Module-level rather than a
+// function param since the overlay's click handler and the replay loop
+// need to share it without threading it through every call in between.
+let _replayCancelRequested = false;
+
 async function _replayOfflineQueue() {
   const queue = _offlineQueue;
   _offlineQueue = [];
   _saveOfflineQueue();
+  _replayCancelRequested = false;
+  const total = queue.length;
+  const progress = _showReplayProgress(total);
   const kindCounts = {};
-  let filesMoved = 0, filesSkipped = 0, failedActions = 0;
+  let filesMoved = 0, filesSkipped = 0, failedActions = 0, done = 0, cancelledCount = 0;
   const skipReasonCounts = {};
   const skipDetails = [];
   for (const action of queue) {
+    if (_replayCancelRequested) {
+      // Not attempted at all -- put back in the real queue (not rejected)
+      // so the next reconnect offers them again, exactly as if this
+      // replay had never started. A cancel mid-way through is "not yet",
+      // not "no", so it shouldn't need the rejected-queue's explicit
+      // restore step to try again.
+      cancelledCount = total - done;
+      _offlineQueue.push(action);
+      continue;
+    }
     try {
       const res = await fetch(action.url, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -5597,17 +5638,56 @@ async function _replayOfflineQueue() {
         _refreshOfflineSnapshotAfterMove(action.kind, action.body).catch(() => {});
       } else failedActions++;
     } catch (e) { failedActions++; }
+    done++;
+    progress.update(done, total);
   }
+  if (_offlineQueue.length) _saveOfflineQueue();
+  progress.close();
   _updateOfflineBanner();
   if (typeof _refreshTreeAt === 'function') { try { await _refreshTreeAt(null); } catch(e) {} }
-  _showReplaySummary({ kindCounts, filesMoved, filesSkipped, skipReasonCounts, skipDetails, failedActions });
+  _showReplaySummary({ kindCounts, filesMoved, filesSkipped, skipReasonCounts, skipDetails, failedActions, cancelledCount });
+}
+
+// A queue can easily run into the thousands of files during a long offline
+// stretch, and every action here is a real, sequential network round trip
+// -- with nothing on screen while that runs, it looked identical to the UI
+// having simply frozen. Shows live progress and lets someone stop partway
+// through (see _replayCancelRequested above) rather than being committed
+// to however long the full queue takes the moment "Apply changes" is clicked.
+function _showReplayProgress(total) {
+  const overlay = document.createElement('div');
+  overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.75);z-index:3000;display:flex;align-items:center;justify-content:center';
+  overlay.innerHTML = `
+    <div style="background:#1a1a1a;border:1px solid #333;border-radius:10px;padding:24px;width:380px">
+      <div style="font-weight:600;font-size:15px;margin-bottom:12px;color:#e0e0e0">Applying offline changes…</div>
+      <div id="_replayProgressText" style="font-size:12px;color:var(--muted);margin-bottom:8px">0 / ${total}</div>
+      <div style="background:#111;border-radius:4px;height:6px;overflow:hidden;margin-bottom:18px">
+        <div id="_replayProgressBar" style="background:#d4a017;height:100%;width:0%;transition:width 0.2s"></div>
+      </div>
+      <div style="display:flex;justify-content:flex-end">
+        <button id="_replayCancelBtn" style="background:#333;border:none;color:#e0e0e0;border-radius:6px;padding:8px 14px;cursor:pointer;font-size:13px">Stop here</button>
+      </div>
+    </div>`;
+  document.body.appendChild(overlay);
+  overlay.querySelector('#_replayCancelBtn').addEventListener('click', () => {
+    _replayCancelRequested = true;
+    overlay.querySelector('#_replayCancelBtn').textContent = 'Stopping…';
+    overlay.querySelector('#_replayCancelBtn').disabled = true;
+  });
+  return {
+    update(done, totalNow) {
+      overlay.querySelector('#_replayProgressText').textContent = `${done} / ${totalNow}`;
+      overlay.querySelector('#_replayProgressBar').style.width = `${totalNow ? Math.round(done / totalNow * 100) : 100}%`;
+    },
+    close() { overlay.remove(); },
+  };
 }
 
 // Deliberately aggregate counts rather than listing every file -- a single
 // offline session can easily involve thousands of files, and this needs to
 // stay readable on one screen regardless of scale. Per-file detail for the
 // (usually much smaller) skipped set is one click away via "Copy details".
-function _showReplaySummary({ kindCounts, filesMoved, filesSkipped, skipReasonCounts, skipDetails, failedActions }) {
+function _showReplaySummary({ kindCounts, filesMoved, filesSkipped, skipReasonCounts, skipDetails, failedActions, cancelledCount }) {
   const esc = s => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
   const appliedParts = [];
   if (filesMoved) appliedParts.push(`${filesMoved.toLocaleString()} file${filesMoved !== 1 ? 's' : ''} moved`);
@@ -5625,6 +5705,9 @@ function _showReplaySummary({ kindCounts, filesMoved, filesSkipped, skipReasonCo
   const failLine = failedActions
     ? `⚠ ${failedActions} action${failedActions !== 1 ? 's' : ''} failed outright — refresh to check the current folder state.`
     : '';
+  const cancelledLine = cancelledCount
+    ? `Stopped early: ${cancelledCount.toLocaleString()} change${cancelledCount !== 1 ? 's' : ''} not yet applied -- still queued, will be offered again next time you reconnect.`
+    : '';
 
   const overlay = document.createElement('div');
   overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.75);z-index:3000;display:flex;align-items:center;justify-content:center';
@@ -5634,6 +5717,7 @@ function _showReplaySummary({ kindCounts, filesMoved, filesSkipped, skipReasonCo
       <div style="font-size:12px;color:#c8c8c8;line-height:1.6">${esc(appliedLine)}</div>
       ${skipLine ? `<div style="font-size:12px;color:#e6b800;margin-top:8px;line-height:1.6">${esc(skipLine)}</div>` : ''}
       ${failLine ? `<div style="font-size:12px;color:#e74c3c;margin-top:8px;line-height:1.6">${esc(failLine)}</div>` : ''}
+      ${cancelledLine ? `<div style="font-size:12px;color:var(--muted);margin-top:8px;line-height:1.6">${esc(cancelledLine)}</div>` : ''}
       <div style="display:flex;gap:10px;justify-content:flex-end;margin-top:18px">
         ${skipDetails.length ? `<button id="_replayCopyBtn" style="background:#333;border:none;color:#e0e0e0;border-radius:6px;padding:9px 14px;cursor:pointer;font-size:13px">Copy details</button>` : ''}
         <button id="_replayDismissBtn" style="background:#d4a017;border:none;color:#181818;font-weight:700;border-radius:6px;padding:9px 14px;cursor:pointer;font-size:13px">OK</button>

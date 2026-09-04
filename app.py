@@ -1947,19 +1947,21 @@ def delete_items():
         try:
             abs_p = (BASE / rel).resolve()
             if not str(abs_p).startswith(base_r):
-                errors.append(rel); continue
+                errors.append({'path': rel, 'reason': 'not_found'}); continue
             if is_folder:
                 if not abs_p.is_dir():
-                    errors.append(rel); continue
+                    errors.append({'path': rel, 'reason': 'not_found'}); continue
             else:
                 if not abs_p.is_file():
-                    errors.append(rel); continue
+                    errors.append({'path': rel, 'reason': 'not_found'}); continue
             # Move to recycle bin instead of permanent deletion
             safe_name = f"{uuid.uuid4().hex}_{abs_p.name}"
             shutil.move(str(abs_p), str(TRASH_DIR / safe_name))
             deleted.append(rel)
-        except Exception:
-            errors.append(rel)
+        except PermissionError:
+            errors.append({'path': rel, 'reason': 'permission'})
+        except Exception as ex:
+            errors.append({'path': rel, 'reason': str(ex)})
     for rel in deleted:
         try:
             abs_p = (BASE / rel).resolve()
@@ -2050,7 +2052,7 @@ def mkdir_folders():
     for name in names[:50]:
         name = name.strip()
         if not name or '/' in name or name.startswith('.'):
-            errors.append(name); continue
+            errors.append({'name': name, 'reason': 'invalid_name'}); continue
         try:
             new_dir = parent_abs / name
             new_dir.mkdir(exist_ok=False)
@@ -2061,9 +2063,9 @@ def mkdir_folders():
                 except OSError: pass
             created.append(name)
         except FileExistsError:
-            errors.append(name)
-        except Exception:
-            errors.append(name)
+            errors.append({'name': name, 'reason': 'duplicate'})
+        except Exception as ex:
+            errors.append({'name': name, 'reason': str(ex)})
     if created:
         _invalidate_listing(parent_abs)
         _invalidate_dir_tree(parent_abs)
