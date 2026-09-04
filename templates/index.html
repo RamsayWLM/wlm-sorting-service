@@ -1111,7 +1111,7 @@ async function api(url) {
     try {
       return await live;
     } catch (e) {
-      _setOffline(true);
+      _setOffline(true, _classifyFetchError(e));
       throw e;
     }
   }
@@ -1121,7 +1121,7 @@ async function api(url) {
   // thumbnails) even though the network itself is fine -- race the live
   // fetch against a short deadline and use the cached copy if live hasn't
   // won by then. The live fetch keeps running in the background regardless.
-  live.then(() => _setOffline(false)).catch(() => _setOffline(true));
+  live.then(() => _setOffline(false)).catch((e) => _setOffline(true, _classifyFetchError(e)));
   return Promise.race([
     live,
     new Promise(resolve => setTimeout(() => resolve(cached), 500)),
@@ -5324,7 +5324,64 @@ function _updateOfflineBanner() {
   }
 }
 
-function _setOffline(val) {
+// Shared debounce state for _setOffline(true): several independent call
+// sites report failures here (the background heartbeat poll, the general
+// api() read helper, sort actions) -- a single failure from ANY of them
+// used to flip the banner on immediately, and the very next success from
+// any of them flipped it straight back off, so normal use (or an ordinary
+// multi-second latency blip over Tailscale) flapped the banner constantly
+// for things that never actually broke anything. The FIRST failure (from
+// any caller) now just starts a shared clock; the banner only actually
+// shows once failures have kept coming for a grace period straight with no
+// success in between -- and that grace period isn't one-size-fits-all: a
+// definite network-level failure (reason 'immediate', e.g. connection
+// refused) gets a short one, an interface actually reported down (reason
+// 'interface-down') gets none at all, and everything else -- a request
+// that merely timed out, genuinely ambiguous between "dead" and "just slow
+// right now" over a client's own connection -- gets the longest one.
+// Coming back online stays immediate on purpose -- there's never a reason
+// to delay telling someone the connection is back.
+let _offlineSince = null;
+const OFFLINE_GRACE_MS = 75000;
+const OFFLINE_GRACE_MS_FAST = 8000;
+
+// fetch() throws a plain TypeError for a real network-level failure (DNS,
+// connection refused, no route) -- thrown by the browser itself, before our
+// own AbortController could possibly have fired. Our own timeout firing
+// throws a DOMException named 'AbortError' instead. Anything else (e.g. a
+// non-ok HTTP status) is neither -- the server responded, so treat it like
+// the ambiguous/slow case rather than assume it says anything about
+// connectivity at all.
+function _classifyFetchError(e) {
+  if (e instanceof TypeError) return 'immediate';
+  if (e && e.name === 'AbortError') return 'timeout';
+  return 'timeout';
+}
+
+// Shown the moment a failure starts the grace-period clock, before it's
+// actually confirmed -- without this, the window between a real disconnect
+// and the grace period elapsing had nothing on screen at all, so a click
+// during it could look like it had simply done nothing.
+function _showReconnectingHint() {
+  const el = document.getElementById('statusRight');
+  if (!el || _isOffline) return;
+  el.textContent = 'Reconnecting…';
+  el.style.color = 'var(--muted, #888)';
+}
+
+function _setOffline(val, reason) {
+  if (val) {
+    if (_offlineSince === null) _offlineSince = Date.now();
+    const grace = reason === 'interface-down' ? 0
+      : reason === 'immediate' ? OFFLINE_GRACE_MS_FAST
+      : OFFLINE_GRACE_MS;
+    if (Date.now() - _offlineSince < grace) {
+      _showReconnectingHint();
+      return;
+    }
+  } else {
+    _offlineSince = null;
+  }
   if (val === _isOffline) return;
   _isOffline = val;
   _updateOfflineBanner();
@@ -5618,7 +5675,7 @@ async function _sendOrQueue(kind, url, bodyObj) {
       if (res.ok) _refreshOfflineSnapshotAfterMove(kind, bodyObj).catch(() => {});
       return res;
     } catch (e) {
-      _setOffline(true);  // fall through to queueing now that we know we're offline
+      _setOffline(true, _classifyFetchError(e));  // fall through to queueing now that we know we're offline
     }
   }
   _offlineQueue.push({ kind, url, body: bodyObj, ts: Date.now() });
@@ -5655,15 +5712,28 @@ async function _sendOrQueue(kind, url, bodyObj) {
       const d = await r.json();
       _setOffline(false);
       const cachePrefix = d.generating_cache ? 'Generating cache…  ·  ' : '';
+      $('statusRight').style.color = '';  // clear any leftover "Reconnecting…" styling
       $('statusRight').innerHTML =
         `${cachePrefix}<span style="color:${_cpuColor(d.cpu_percent)}">CPU ${Math.round(d.cpu_percent)}%</span>` +
         `  ·  ↑ ${d.upload_mbps.toFixed(1)}  ↓ ${d.download_mbps.toFixed(1)} Mbps`;
     } catch(e) {
-      _setOffline(true);
+      _setOffline(true, _classifyFetchError(e));
     }
   }
   _pollSystemStats();
   setInterval(_pollSystemStats, 3000);
+
+  // navigator.onLine reflects whether the OS thinks a network interface is
+  // up at all, not whether the client's Flask server specifically is
+  // reachable -- next to useless as a general "are we offline" signal. But
+  // its 'offline' event firing means the OS itself just reported the
+  // interface going down, which is about as certain as a disconnect ever
+  // gets -- worth an instant flip rather than waiting out any grace period.
+  // 'online' firing back only triggers an immediate recheck, not a direct
+  // "we're online" claim, since Tailscale itself may still be reconnecting
+  // on top of a freshly-up interface.
+  window.addEventListener('offline', () => _setOffline(true, 'interface-down'));
+  window.addEventListener('online', () => _pollSystemStats());
 })();
 
 // ── Browser cache prefetch ─────────────────────────────────────────────────────
