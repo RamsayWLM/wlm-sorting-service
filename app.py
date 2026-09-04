@@ -2403,6 +2403,27 @@ def _tailscale_binary():
     return 'tailscale'
 
 
+def _tailscale_env():
+    """Environment for every subprocess call into the Tailscale binary.
+
+    Most clients never run "Install Tailscale command line tool" from the
+    Tailscale menu, so `tailscale` isn't on PATH and _tailscale_binary()
+    falls back to the raw executable inside the standalone .app bundle
+    (Contents/MacOS/Tailscale). That single binary decides whether to act
+    as the CLI or launch as the windowed GUI app by inspecting shell-ish
+    environment variables (SHLVL, TERM, TERM_PROGRAM, PS1) -- all of which
+    are simply absent when we spawn it from a frozen Tkinter app rather
+    than a shell. Without them it can decide to launch as a second GUI
+    instance, which fails because one is already running and surfaces as
+    "The Tailscale GUI failed to start... (Tailscale.CLIError error 3)" --
+    confirmed live: this exact failure on a real client machine, with
+    Tailscale itself connected and healthy the whole time. TAILSCALE_BE_CLI=1
+    is Tailscale's own documented override to force CLI mode regardless of
+    what invoked it, so every call site below gets it rather than relying
+    on a client's shell environment we don't control."""
+    return {**os.environ, 'TAILSCALE_BE_CLI': '1'}
+
+
 def _tailscale_ip_is_live(ip: str) -> bool:
     """`tailscale ip -4` keeps returning the last-known address (exit code 0,
     no error) even after Tailscale has been stopped/disconnected — it's
@@ -2432,7 +2453,7 @@ def _get_tailscale_ip(retry_interval=5):
         try:
             result = subprocess.run(
                 [_tailscale_binary(), 'ip', '-4'],
-                capture_output=True, text=True, timeout=5,
+                capture_output=True, text=True, timeout=5, env=_tailscale_env(),
             )
             lines = result.stdout.strip().splitlines()
             if result.returncode == 0 and lines and _tailscale_ip_is_live(lines[0]):
@@ -2450,7 +2471,7 @@ def _get_tailscale_hostname():
     try:
         result = subprocess.run(
             [_tailscale_binary(), 'status', '--json'],
-            capture_output=True, text=True, timeout=5,
+            capture_output=True, text=True, timeout=5, env=_tailscale_env(),
         )
         if result.returncode == 0:
             data = json.loads(result.stdout)
@@ -2478,7 +2499,7 @@ def _get_tailscale_https_cert(hostname):
         keyfile = _TLS_CERT_DIR / f'{hostname}.key'
         result = subprocess.run(
             [_tailscale_binary(), 'cert', f'--cert-file={certfile}', f'--key-file={keyfile}', hostname],
-            capture_output=True, text=True, timeout=30,
+            capture_output=True, text=True, timeout=30, env=_tailscale_env(),
         )
         if result.returncode == 0 and certfile.exists() and keyfile.exists():
             return str(certfile), str(keyfile)
