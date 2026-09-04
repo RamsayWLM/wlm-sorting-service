@@ -5,3 +5,4 @@ __pycache__/
 .wlm_trash/
 build/
 dist/
+node_modules/
