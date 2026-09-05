@@ -217,6 +217,44 @@ VIDEO_EXTS = {'.mov', '.mp4', '.mts', '.m2ts', '.mkv', '.avi'}
 PHOTO_EXTS = JPEG_EXTS | RAW_EXTS
 MEDIA_EXTS = PHOTO_EXTS | VIDEO_EXTS
 
+
+def _find_pair_twin(abs_path: Path) -> Path | None:
+    """If abs_path is a JPEG or RAW file shot as a JPEG+RAW pair (same base
+    name, same folder, one of each), return the other half.
+
+    Shooting both means every photo exists as two files that represent one
+    shot -- acting on only one (moving it, rating it, deleting it) while
+    leaving its twin behind would silently split a pair apart, which is
+    exactly the "duplicate" problem this whole feature exists to avoid.
+    Used by every mutation below so a client only ever has to know about
+    the JPEG half (which /api/photos-in also treats as the pair's single
+    visible entry -- see there for why the JPEG is the one shown) and the
+    RAW half is carried along automatically, transparently, without any
+    client-side code needing to know pairs exist at all."""
+    ext = abs_path.suffix.lower()
+    if ext in JPEG_EXTS:
+        candidates = RAW_EXTS
+    elif ext in RAW_EXTS:
+        candidates = JPEG_EXTS
+    else:
+        return None
+    stem, parent = abs_path.stem, abs_path.parent
+    # Scan real directory entries rather than constructing "stem + lowercase
+    # extension" and checking is_file() on that -- real camera output is
+    # almost always uppercase (DSC_1234.NEF, not .nef). A client's own Mac
+    # is usually case-insensitive so this specific mismatch might not bite
+    # there the way it did on the NAS's case-sensitive filesystem when this
+    # was first built and tested, but scanning real entries is correct
+    # either way and doesn't rely on that difference.
+    try:
+        for sibling in parent.iterdir():
+            if sibling.stem == stem and sibling.suffix.lower() in candidates and sibling.is_file():
+                return sibling
+    except OSError:
+        pass
+    return None
+
+
 LOGO_PATH = Path(__file__).parent / 'static' / 'wlm_logo.png'
 
 # -- AI Sort Assistant: proxy to whichever matcher machine is currently online --
@@ -1313,18 +1351,35 @@ def photos_in(folder):
         ratings = ratings_cache[folder_key]
         athlete = clean_name(root_path.name)
 
+        # Shot-both (JPEG+RAW) pairs: group this folder's media files by base
+        # name up front so a RAW whose JPEG twin is also present here can be
+        # skipped below -- the JPEG's own entry represents the pair (see
+        # _find_pair_twin for why acting on the JPEG carries the RAW along
+        # automatically). A RAW with no JPEG twin, or a JPEG with no RAW
+        # twin, is unaffected and lists exactly as it always has.
+        by_stem: dict[str, dict[str, str]] = {}
+        for f in files:
+            if f.startswith('.'):
+                continue
+            ext = Path(f).suffix.lower()
+            if ext in PHOTO_EXTS:
+                by_stem.setdefault(Path(f).stem, {})[ext] = f
+
         for f in sorted(files):
             if f.startswith('.'):
                 continue
             ext = Path(f).suffix.lower()
             if ext in MEDIA_EXTS:
+                siblings = by_stem.get(Path(f).stem, {})
+                if ext in RAW_EXTS and any(e in JPEG_EXTS for e in siblings):
+                    continue  # represented by the JPEG twin's entry instead
                 if len(entries) >= limit:
                     truncated = True
                     break
                 rel = str((root_path / f).relative_to(BASE))
                 entry = ratings.get(f, {})
                 ts = _read_ts(root_path / f) or 0
-                entries.append((ts, {
+                item = {
                     'path':    rel,
                     'name':    f,
                     'type':    'video' if ext in VIDEO_EXTS else 'photo',
@@ -1332,7 +1387,12 @@ def photos_in(folder):
                     'rating':  entry.get('rating', 0),
                     'flag':    entry.get('flag', 'none'),
                     'label':   entry.get('label', 'none'),
-                }))
+                }
+                if ext in JPEG_EXTS:
+                    raw_name = next((siblings[e] for e in siblings if e in RAW_EXTS), None)
+                    if raw_name:
+                        item['raw_path'] = str((root_path / raw_name).relative_to(BASE))
+                entries.append((ts, item))
         if truncated:
             break
 
@@ -1439,29 +1499,42 @@ def move_files():
         return jsonify({'moved': [], 'errors': src_paths, 'error': 'Target folder not found'})
     moved, errors = [], []
     src_dirs = set()
+    already_moved_abs: set[Path] = set()  # twins moved as a side effect -- skip if also listed explicitly
+
+    def _move_one(src: Path, rel: str):
+        dst = dst_dir / src.name
+        if dst.exists():
+            errors.append({'path': rel, 'reason': 'duplicate', 'name': src.name}); return
+        src_dirs.add(src.parent)
+        new_rel = str(dst.relative_to(BASE))
+        old_thumb = _thumb_path(rel)
+        src.rename(dst)
+        # Carry the cached thumbnail along with the file it belongs to, instead of
+        # leaving it orphaned at the old path -- a move shouldn't force a from-scratch
+        # regeneration (a real ffmpeg re-extraction for video) of an unchanged image.
+        if old_thumb.exists():
+            new_thumb = _thumb_path(new_rel)
+            try:
+                new_thumb.parent.mkdir(parents=True, exist_ok=True)
+                old_thumb.replace(new_thumb)
+            except OSError:
+                pass
+        moved.append(rel)
+
     for rel in src_paths:
         try:
             src = (BASE / rel).resolve()
             if not str(src).startswith(base_r) or not src.is_file():
                 errors.append({'path': rel, 'reason': 'not_found'}); continue
-            dst = dst_dir / src.name
-            if dst.exists():
-                errors.append({'path': rel, 'reason': 'duplicate', 'name': src.name}); continue
-            src_dirs.add(src.parent)
-            new_rel = str(dst.relative_to(BASE))
-            old_thumb = _thumb_path(rel)
-            src.rename(dst)
-            # Carry the cached thumbnail along with the file it belongs to, instead of
-            # leaving it orphaned at the old path -- a move shouldn't force a from-scratch
-            # regeneration (a real ffmpeg re-extraction for video) of an unchanged image.
-            if old_thumb.exists():
-                new_thumb = _thumb_path(new_rel)
-                try:
-                    new_thumb.parent.mkdir(parents=True, exist_ok=True)
-                    old_thumb.replace(new_thumb)
-                except OSError:
-                    pass
-            moved.append(rel)
+            if src in already_moved_abs:
+                continue  # already carried along as another path's RAW/JPEG twin
+            # Shot-both pairs move together -- see _find_pair_twin. Found before
+            # src itself moves, since the check is filesystem-based.
+            twin = _find_pair_twin(src)
+            _move_one(src, rel)
+            if twin and twin not in already_moved_abs:
+                already_moved_abs.add(twin)
+                _move_one(twin, str(twin.relative_to(BASE)))
         except PermissionError:
             errors.append({'path': rel, 'reason': 'permission'})
         except Exception as ex:
@@ -1943,6 +2016,13 @@ def delete_items():
     base_r = str(BASE.resolve())
     deleted, errors = [], []
     TRASH_DIR.mkdir(exist_ok=True)
+    already_deleted_abs: set[Path] = set()  # twins deleted as a side effect
+
+    def _delete_one(abs_p: Path, rel: str):
+        safe_name = f"{uuid.uuid4().hex}_{abs_p.name}"
+        shutil.move(str(abs_p), str(TRASH_DIR / safe_name))
+        deleted.append(rel)
+
     for rel in paths[:100]:
         try:
             abs_p = (BASE / rel).resolve()
@@ -1951,13 +2031,20 @@ def delete_items():
             if is_folder:
                 if not abs_p.is_dir():
                     errors.append({'path': rel, 'reason': 'not_found'}); continue
-            else:
-                if not abs_p.is_file():
-                    errors.append({'path': rel, 'reason': 'not_found'}); continue
-            # Move to recycle bin instead of permanent deletion
-            safe_name = f"{uuid.uuid4().hex}_{abs_p.name}"
-            shutil.move(str(abs_p), str(TRASH_DIR / safe_name))
-            deleted.append(rel)
+                _delete_one(abs_p, rel)
+                continue
+            if not abs_p.is_file():
+                errors.append({'path': rel, 'reason': 'not_found'}); continue
+            if abs_p in already_deleted_abs:
+                continue  # already carried along as another path's RAW/JPEG twin
+            # Shot-both pairs are deleted together -- see _find_pair_twin.
+            # Found before abs_p itself is trashed, since the check is
+            # filesystem-based.
+            twin = _find_pair_twin(abs_p)
+            _delete_one(abs_p, rel)
+            if twin and twin not in already_deleted_abs:
+                already_deleted_abs.add(twin)
+                _delete_one(twin, str(twin.relative_to(BASE)))
         except PermissionError:
             errors.append({'path': rel, 'reason': 'permission'})
         except Exception as ex:
@@ -2318,6 +2405,12 @@ def rate_photos():
         p = BASE / rel
         if p.is_file():
             by_folder[str(p.parent)].append((rel, p.name))
+            # Shot-both pairs are rated/flagged together -- see _find_pair_twin.
+            # Ratings are keyed by filename in .wlm_ratings.json, so the twin
+            # just needs its own name added to the same folder's batch below.
+            twin = _find_pair_twin(p)
+            if twin:
+                by_folder[str(twin.parent)].append((str(twin.relative_to(BASE)), twin.name))
 
     for folder_str, items in by_folder.items():
         folder_path = Path(folder_str)
