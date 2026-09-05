@@ -25,6 +25,7 @@ import os
 import re
 import shutil
 import signal
+import ssl
 import subprocess
 import sys
 import tempfile
@@ -40,7 +41,7 @@ from tkinter import filedialog, messagebox
 
 from PIL import Image, ImageTk
 
-APP_VERSION = "1.5.0"
+APP_VERSION = "1.6.0"
 
 # Public GitHub repo hosting release builds for self-update -- no auth token
 # needed for the unauthenticated "latest release" read, at the cost of the
@@ -191,6 +192,26 @@ def _parse_version(v: str):
         return (0,)
 
 
+def _https_context() -> ssl.SSLContext:
+    """An SSL context that verifies against our own bundled CA file, not
+    Python's compiled-in default.
+
+    Root cause of a real bug found live (a client stayed on the very first
+    version, v1.1.0, for hours despite four releases going out): this app is
+    built with Homebrew's Python, whose ssl module has Homebrew's own cert
+    path (/opt/homebrew/etc/openssl@3/cert.pem) baked in as the *default*
+    verify location. That path only exists on this build machine -- a
+    client's Mac has no Homebrew at all -- so every HTTPS request the
+    updater made was silently failing certificate verification, forever,
+    on every single hourly check, with nothing surfacing anywhere a client
+    (or anyone remote) would ever see it. Bundling a real CA file
+    (resources/cacert.pem, a copy of the certifi package's bundle) and
+    pointing an explicit SSLContext at it sidesteps the broken default
+    entirely, regardless of what Python built this app or what's
+    installed on the machine running it."""
+    return ssl.create_default_context(cafile=str(_resource_dir() / 'cacert.pem'))
+
+
 def _check_and_apply_update():
     """Checks UPDATE_REPO's latest GitHub release against APP_VERSION and,
     if newer, downloads + verifies + installs it, then relaunches through
@@ -212,7 +233,7 @@ def _check_and_apply_update():
             f'https://api.github.com/repos/{UPDATE_REPO}/releases/latest',
             headers={'User-Agent': 'wlm-sorting-service-updater', 'Accept': 'application/vnd.github+json'},
         )
-        with urllib.request.urlopen(req, timeout=15) as r:
+        with urllib.request.urlopen(req, timeout=15, context=_https_context()) as r:
             release = json.loads(r.read())
 
         remote_version = release.get('tag_name', '')
@@ -232,7 +253,15 @@ def _check_and_apply_update():
         print(f"[update] {APP_VERSION} -> {remote_version}: downloading {zip_asset['name']}...", flush=True)
         with tempfile.TemporaryDirectory() as tmp:
             zip_path = Path(tmp) / 'update.zip'
-            urllib.request.urlretrieve(zip_asset['browser_download_url'], zip_path)
+            # urlretrieve() has no way to pass an SSL context -- urlopen()
+            # does, so this reads and writes the file manually instead of
+            # using the (otherwise more convenient) shortcut function.
+            dl_req = urllib.request.Request(
+                zip_asset['browser_download_url'],
+                headers={'User-Agent': 'wlm-sorting-service-updater'},
+            )
+            with urllib.request.urlopen(dl_req, timeout=60, context=_https_context()) as r:
+                zip_path.write_bytes(r.read())
 
             actual_sha256 = hashlib.sha256(zip_path.read_bytes()).hexdigest()
             if actual_sha256 != expected_sha256:
@@ -332,7 +361,16 @@ def _set_launch_at_login(enabled: bool):
 def _gather_diagnostics(folder: str) -> str:
     try:
         ts_bin = server_app._tailscale_binary()
-        result = subprocess.run([ts_bin, 'ip', '-4'], capture_output=True, text=True, timeout=5)
+        # This call site was missed when TAILSCALE_BE_CLI=1 was added to fix
+        # "The Tailscale GUI failed to start" elsewhere (server_app's own
+        # calls) -- found live via a real client's diagnostics output still
+        # showing the old error after that fix had already shipped. The
+        # actual server binding was never affected (it uses server_app's
+        # fixed calls); only this diagnostic readout was stale/misleading.
+        result = subprocess.run(
+            [ts_bin, 'ip', '-4'], capture_output=True, text=True, timeout=5,
+            env=server_app._tailscale_env(),
+        )
         ts_ip = result.stdout.strip().splitlines()[0] if result.returncode == 0 and result.stdout.strip() else "not connected"
     except Exception:
         ts_ip = "tailscale not found"

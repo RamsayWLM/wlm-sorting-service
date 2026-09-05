@@ -10,6 +10,7 @@ a = Analysis(
         ('templates', 'templates'),
         ('static', 'static'),
         ('resources/exiftool', 'resources/exiftool'),
+        ('resources/cacert.pem', 'resources'),
     ],
     hiddenimports=[],
     hookspath=[],
