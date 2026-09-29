@@ -1,0 +1,87 @@
+WLM SORTING SERVICE — TEST INSTRUCTIONS
+=========================================
+
+This test uses TWO roles:
+  - "Test laptop" = a separate laptop pretending to be the client's machine
+  - "Our side"     = whoever is connecting from White Lights Media to check it works
+
+Do NOT use the whitelightsmediauk@gmail.com Tailscale account on the test
+laptop — it needs to be a completely separate, brand-new Tailscale account,
+just like a real client would have.
+
+
+PART 1 — On the TEST laptop (playing the role of the client)
+--------------------------------------------------------------
+
+1. Make sure this laptop is not already signed into White Lights Media's
+   Tailscale account. If Tailscale is already installed and signed in as
+   us, sign out first — or use a laptop that's never had Tailscale on it.
+
+2. Double-click "WLM Sorting Service.app" to launch it.
+
+   macOS will very likely block it the first time with a message like
+   "cannot be opened because the developer cannot be verified" — this is
+   expected (the app isn't Apple-notarized). To get past it:
+       Right-click (or Control-click) the app icon → "Open" →
+       click "Open" again in the popup that appears.
+   You only need to do this once; it'll launch normally after that.
+
+3. The app's own setup screen walks through everything from here — just
+   follow it step by step:
+     a. Install Tailscale (button provided)
+     b. Sign in to Tailscale with ANY Google, Microsoft, or email account —
+        a brand new one is fine. This must be a DIFFERENT account from
+        whitelightsmediauk@gmail.com.
+     c. Open the Tailscale admin console (button provided), go to the DNS
+        tab, and turn on "HTTPS Certificates". One-time setting.
+     d. Click the Tailscale icon in the menu bar → "Share..." → select this
+        computer → share it with:
+              whitelightsmediauk@gmail.com
+     e. Pick a folder for White Lights Media to work in, then click Done.
+
+4. Once setup finishes, the status screen shows a green dot and an address
+   that looks like:
+              https://<something>.ts.net:2514
+
+   Nothing needs to be sent to us — see Part 2, step 2. ("Copy diagnostics"
+   is just a handy fallback if the address below doesn't work for some
+   reason.)
+
+
+PART 2 — On OUR side (accepting the share + connecting)
+--------------------------------------------------------------
+
+1. Make sure you're signed into Tailscale with the whitelightsmediauk@gmail.com
+   account.
+
+2. Accept the Tailscale share invite (arrives as an email from Tailscale —
+   click accept there). Once accepted, the test laptop appears directly in
+   our own Tailscale admin console's device list, under a "Shared" section
+   — its hostname is shown right there. The address to use is:
+              https://<that hostname>:2514
+   (the port is always 2514 — it's fixed in the app, not something the
+   client sets). No need to ask the test laptop for anything.
+
+3. Open that address in a browser (Chrome recommended). You should see a
+   login page with no certificate warnings.
+
+4. Log in with the password:
+              Yellowmango1!
+
+5. You should now see the sorting UI, showing the folder the test laptop
+   chose. Try selecting a few files and moving/renaming them to confirm
+   changes actually happen on the test laptop.
+
+6. Optional — test offline mode: right-click a folder → "Cache thumbnails",
+   wait for "✓ ready for offline", then have the test laptop disconnect
+   Tailscale (or just fully quit and reopen the app) and confirm that
+   folder's photos still show.
+
+
+NOTES
+--------------------------------------------------------------
+- The client (test laptop) never sees a login screen or the sorting UI at
+  all — only the status screen from Part 1. Everything sorting-related
+  only ever appears on OUR side, in a browser.
+- If something doesn't work, use "Copy diagnostics" on the test laptop and
+  send the result to Ramsay along with a description of what happened.

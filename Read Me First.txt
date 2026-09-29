@@ -1,0 +1,47 @@
+WLM SORTING SERVICE
+====================
+
+This app lets White Lights Media remotely sort and organize your photos —
+you install it, pick a folder, and our team does the rest over a secure
+connection. You never need to use the sorting tool yourself.
+
+
+STEP 1 — Opening the app for the first time
+--------------------------------------------
+macOS will likely block it the first time with a message like:
+
+    "WLM Sorting Service" cannot be opened because the developer
+    cannot be verified.
+
+This is expected — the app isn't distributed through the Mac App Store,
+so macOS is just being cautious. To open it anyway:
+
+    1. Right-click (or Control-click) the app icon
+    2. Choose "Open" from the menu
+    3. Click "Open" again in the popup that appears
+
+You only need to do this once — it opens normally from then on.
+
+
+STEP 2 — Follow the app's own setup screen
+--------------------------------------------
+Once it opens, the app walks you through everything itself: installing
+Tailscale (the secure connection this runs over), signing in with your
+own free account, and choosing a folder for us to work in. Just follow
+it step by step — nothing to figure out on your own.
+
+One thing worth knowing in advance: during the Tailscale install, macOS
+will ask permission to add a VPN/network extension — click Allow. That's
+Tailscale's own setup, not this app, and it's normal.
+
+When it's done, you'll see a green dot and "Connected — Ready for White
+Lights Media." That's it — you're set up, and there's nothing else to
+send us or do.
+
+
+QUESTIONS OR SOMETHING NOT WORKING?
+--------------------------------------------
+Get in touch with Ramsay at White Lights Media. If something looks wrong,
+there's a "Copy diagnostics..." button on the app's status screen — copy
+that and send it along, it helps us see what's going on without needing
+to ask you a bunch of questions first.

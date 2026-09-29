@@ -3352,8 +3352,18 @@ function renderLb() {
   // first byte instead of the UI going silent for the whole transfer on a
   // large file over a slow connection.
   $('lbSave').onclick = null;
-  $('lbSave').href = `/api/download-file/${encPath(m.path)}`;
-  $('lbSave').download = m.name;
+  if (m.raw_path) {
+    // JPEG+RAW pair: one "Save" click should get both files (bundled as a
+    // zip by _downloadPaths), not just the on-screen JPEG. A single
+    // <a download> can only ever fetch one file, so route through
+    // _downloadPaths instead when there's a RAW twin.
+    $('lbSave').removeAttribute('href');
+    $('lbSave').removeAttribute('download');
+    $('lbSave').onclick = (e) => { e.preventDefault(); _downloadPaths([m.path, m.raw_path]); };
+  } else {
+    $('lbSave').href = `/api/download-file/${encPath(m.path)}`;
+    $('lbSave').download = m.name;
+  }
   if (m.type === 'video') {
     const src = `/video/${encPath(m.path)}`;
     $('lbMedia').innerHTML = `<video src="${src}" controls playsinline></video>`;
@@ -6116,7 +6126,17 @@ async function _downloadPaths(paths) {
 
 async function downloadSelected() {
   if (!selected.size) return;
-  const paths = [...selected].map(i => filtered[i].path);
+  const paths = [];
+  for (const i of selected) {
+    const it = filtered[i];
+    if (!it) continue;
+    paths.push(it.path);
+    // A shot-both (JPEG+RAW) pair shows as one thumbnail but is two real
+    // files -- download both halves, the same way move/delete/rate carry
+    // the pair together (see _find_pair_twin in app.py). Without this the
+    // client only ever gets the JPEG, never the .NEF/.ARW/.RW2.
+    if (it.raw_path) paths.push(it.raw_path);
+  }
   await _downloadPaths(paths);
 }
 

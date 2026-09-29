@@ -41,7 +41,7 @@ from tkinter import filedialog, messagebox
 
 from PIL import Image, ImageTk
 
-APP_VERSION = "1.6.0"
+APP_VERSION = "1.7.0"
 
 # Public GitHub repo hosting release builds for self-update -- no auth token
 # needed for the unauthenticated "latest release" read, at the cost of the
@@ -100,13 +100,16 @@ CONFIG_FILE = CONFIG_DIR / 'config.json'
 WLM_TAILSCALE_SHARE_EMAIL = "whitelightsmediauk@gmail.com"
 
 SETUP_STEPS_TEXT = (
-    "1. Download and install Tailscale (button below).\n\n"
+    "1. Download and install Tailscale (button below). macOS will ask for "
+    "permission to add a VPN/network extension during install — click "
+    "Allow. This is Tailscale's own setup, not this app; it's normal.\n\n"
     "2. Open Tailscale and sign in — any Google, Microsoft, or email account "
     "works. This creates your own free Tailscale account, completely "
     "separate from White Lights Media's.\n\n"
-    "3. Open the Tailscale admin console (button below), go to the DNS tab, "
-    "and turn on \"HTTPS Certificates\". This is a one-time setting for your "
-    "account — it lets this app connect securely.\n\n"
+    "3. Click the button below to open the Tailscale admin console — it "
+    "opens straight to the right page. Turn on \"HTTPS Certificates\" there. "
+    "This is a one-time setting for your account — it lets this app connect "
+    "securely.\n\n"
     "4. Click the Tailscale icon in your menu bar, choose \"Share...\", "
     "select this computer, and share it with:\n"
     f"        {WLM_TAILSCALE_SHARE_EMAIL}\n\n"
