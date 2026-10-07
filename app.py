@@ -13,6 +13,7 @@ import uuid
 import zipfile
 
 import psutil
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from io import BytesIO
@@ -1693,7 +1694,7 @@ def api_cache_folder(folder):
         abort(404)
     job_id = uuid.uuid4().hex[:8]
     with _jobs_mu:
-        _jobs[job_id] = {'done': 0, 'total': 0, 'finished': False, 'errors': 0, 'folder': folder}
+        _jobs[job_id] = {'done': 0, 'total': 0, 'finished': False, 'errors': 0, 'folder': folder, 'started': time.time()}
     threading.Thread(target=_cache_folder_worker, args=(job_id, folder), daemon=True).start()
     return jsonify({'job_id': job_id})
 
@@ -1717,7 +1718,7 @@ def api_thumb_size_mode():
         if folders:
             regen_job_id = uuid.uuid4().hex[:8]
             with _jobs_mu:
-                _jobs[regen_job_id] = {'done': 0, 'total': 0, 'finished': False, 'errors': 0, 'folder': 'All cached folders'}
+                _jobs[regen_job_id] = {'done': 0, 'total': 0, 'finished': False, 'errors': 0, 'folder': 'All cached folders', 'started': time.time()}
             threading.Thread(target=_regenerate_all_worker, args=(regen_job_id, folders), daemon=True).start()
     return jsonify({
         'small_cache': _small_cache_enabled,
@@ -1871,6 +1872,182 @@ try:
     _net_io_last = {'ts': time.time(), 'bytes_sent': _io.bytes_sent, 'bytes_recv': _io.bytes_recv}
 except Exception:
     pass
+
+
+# ── Situation report ──────────────────────────────────────────────────────────
+# One page for WLM's team that answers "what's going on with this install?"
+# remotely -- built after a client sat on an old version for an evening and the
+# only way to tell was diffing the served HTML against git history. Behind the
+# same login as everything else. client_shell sets SITREP_PROVIDER to add what
+# only it knows (app version, bundle location, last update check, log lines).
+SITREP_PROVIDER = None
+_STARTED_AT = time.time()
+_SLOW_REQUEST_SECS = 2.0
+_slow_requests: 'deque[dict]' = deque(maxlen=60)
+
+@app.before_request
+def _sitrep_req_start():
+    request._wlm_t0 = time.monotonic()
+
+@app.after_request
+def _sitrep_req_end(resp):
+    t0 = getattr(request, '_wlm_t0', None)
+    if t0 is not None:
+        dt = time.monotonic() - t0
+        if dt >= _SLOW_REQUEST_SECS and request.endpoint not in ('sitrep_page', 'api_sitrep'):
+            _slow_requests.append({'at': time.strftime('%H:%M:%S'), 'path': request.path[:200],
+                                   'secs': round(dt, 1), 'status': resp.status_code})
+    return resp
+
+
+def _volume_info(path: Path) -> dict:
+    info = {'path': str(path)}
+    try:
+        du = shutil.disk_usage(path)
+        info.update(free_gb=round(du.free / 1e9, 1), total_gb=round(du.total / 1e9, 1))
+    except OSError as e:
+        info['error'] = str(e)
+    try:
+        best = None
+        rp = str(path.resolve())
+        for part in psutil.disk_partitions(all=True):
+            if rp == part.mountpoint or rp.startswith(part.mountpoint.rstrip('/') + '/'):
+                if best is None or len(part.mountpoint) > len(best.mountpoint):
+                    best = part
+        if best:
+            info.update(mount=best.mountpoint, fstype=best.fstype, device=best.device)
+    except Exception:
+        pass
+    return info
+
+
+def _sitrep() -> dict:
+    now = time.time()
+    with _jobs_mu:
+        jobs = []
+        for jid, j in _jobs.items():
+            if j.get('finished') and now - j.get('started', 0) > 6 * 3600:
+                continue
+            elapsed = now - j['started'] if j.get('started') else None
+            rate = (j.get('done', 0) / elapsed * 60) if elapsed and elapsed > 30 else None
+            left = (j.get('total', 0) - j.get('done', 0))
+            jobs.append({
+                'id': jid, 'folder': j.get('folder'), 'done': j.get('done', 0), 'total': j.get('total', 0),
+                'errors': j.get('errors', 0), 'finished': bool(j.get('finished')),
+                'per_min': round(rate, 1) if rate else None,
+                'eta_min': round(left / rate) if rate and not j.get('finished') else None,
+            })
+    try:
+        mem = psutil.virtual_memory()
+        mem_info = {'used_pct': mem.percent, 'total_gb': round(mem.total / 1e9, 1)}
+    except Exception:
+        mem_info = {}
+    try:
+        load = [round(x, 2) for x in os.getloadavg()]
+    except (OSError, AttributeError):
+        load = None
+    thumbs = _get_thumb_dir_stats()
+    report = {
+        'generated_at': time.strftime('%Y-%m-%d %H:%M:%S %Z'),
+        'server_uptime_min': round((now - _STARTED_AT) / 60, 1),
+        'working_folder': _volume_info(BASE),
+        'thumbnail_cache': {**_volume_info(THUMB_DIR), 'count': thumbs['count'],
+                            'mb': round(thumbs['bytes'] / 1e6, 1)},
+        'system': {'cpu_pct': psutil.cpu_percent(interval=None), 'cpu_count': os.cpu_count(),
+                   'load_avg': load, 'memory': mem_info},
+        'cache_jobs': jobs,
+        'cache_job_workers': _CACHE_JOB_WORKERS,
+        'browse_requests_in_flight': _interactive_inflight,
+        'slow_requests': list(_slow_requests)[::-1],
+        'tools': {'ffmpeg': shutil.which('ffmpeg'), 'exiftool': shutil.which('exiftool')},
+    }
+    try:
+        report['tailscale_hostname'] = _get_tailscale_hostname()
+    except Exception:
+        pass
+    if SITREP_PROVIDER:
+        try:
+            report.update(SITREP_PROVIDER())
+        except Exception as e:
+            report['shell_error'] = repr(e)
+    return report
+
+
+@app.route('/api/sitrep')
+def api_sitrep():
+    return jsonify(_sitrep())
+
+
+@app.route('/sitrep')
+def sitrep_page():
+    return Response(_SITREP_PAGE, mimetype='text/html')
+
+
+_SITREP_PAGE = """<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sitrep · WLM Sorting Service</title>
+<style>
+ body{background:#181818;color:#e0e0e0;font:14px -apple-system,system-ui,sans-serif;margin:0;padding:20px 16px}
+ h1{font-size:18px;margin:0 0 4px;color:#d4a017} .sub{color:#888;margin-bottom:16px}
+ .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:12px}
+ .card{background:#242424;border-radius:8px;padding:12px 14px} .card h2{font-size:13px;color:#d4a017;margin:0 0 8px;text-transform:uppercase;letter-spacing:.04em}
+ table{border-collapse:collapse;width:100%} td{padding:3px 0;vertical-align:top} td:first-child{color:#999;padding-right:12px;white-space:nowrap}
+ .bad{color:#e74c3c;font-weight:600} .ok{color:#2ecc71} .warn{color:#e6b800}
+ pre{background:#111;padding:10px;border-radius:6px;overflow-x:auto;font-size:11.5px;max-height:420px;white-space:pre-wrap;word-break:break-all;margin:0}
+ button{background:#404040;color:#fff;border:0;border-radius:6px;padding:6px 12px;cursor:pointer;margin-left:8px}
+</style></head><body>
+<h1>Situation report</h1><div class="sub" id="sub">Loading…</div>
+<div class="grid" id="grid"></div>
+<div class="card" style="margin-top:12px"><h2>Recent log</h2><pre id="log">…</pre></div>
+<script>
+const esc = s => String(s ?? '').replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+const row = (k, v, cls) => `<tr><td>${esc(k)}</td><td class="${cls||''}">${esc(v)}</td></tr>`;
+const card = (t, rows) => `<div class="card"><h2>${esc(t)}</h2><table>${rows.join('')}</table></div>`;
+async function load() {
+  let d;
+  try { d = await (await fetch('/api/sitrep', {cache: 'no-store'})).json(); }
+  catch (e) { document.getElementById('sub').textContent = 'Could not load: ' + e; return; }
+  const latest = d.update && d.update.latest_seen;
+  const behind = latest && d.app_version && latest.replace(/^v/,'') !== d.app_version;
+  document.getElementById('sub').innerHTML = `${esc(d.generated_at)} · server up ${esc(d.server_uptime_min)} min
+    <button onclick="load()">Refresh</button><button onclick="navigator.clipboard.writeText(JSON.stringify(window._d,null,2))">Copy JSON</button>`;
+  window._d = d;
+  const u = d.update || {}, b = d.bundle || {};
+  const cards = [];
+  cards.push(card('App', [
+    row('Version', (d.app_version || '?') + (behind ? `  (latest is ${latest})` : ''), behind ? 'bad' : 'ok'),
+    row('Last update check', u.last_check || 'never'),
+    row('Result', u.result || '—', u.error ? 'bad' : ''),
+    u.error ? row('Error', u.error, 'bad') : '',
+    row('Installed at', b.path || '—'),
+    row('Can self-update here', b.translocated ? 'NO: running from a quarantined copy (move the app to Applications)' : (b.writable === false ? 'NO: folder not writable' : 'yes'), (b.translocated || b.writable === false) ? 'bad' : 'ok'),
+    row('Launch at login', d.launch_at_login === undefined ? '—' : (d.launch_at_login ? 'on' : 'off')),
+    row('Tailscale', d.tailscale_hostname || '—'),
+  ]));
+  const wf = d.working_folder || {}, tc = d.thumbnail_cache || {};
+  cards.push(card('Storage', [
+    row('Working folder', wf.path), row('Drive', [wf.mount, wf.fstype].filter(Boolean).join(' · ')),
+    row('Free', wf.free_gb != null ? `${wf.free_gb} of ${wf.total_gb} GB` : (wf.error || '—'), wf.free_gb != null && wf.free_gb < 10 ? 'warn' : ''),
+    row('Thumbnails', `${tc.count} files · ${tc.mb} MB`), row('Cache disk free', tc.free_gb != null ? `${tc.free_gb} GB` : '—', tc.free_gb != null && tc.free_gb < 5 ? 'bad' : ''),
+  ]));
+  const s = d.system || {};
+  cards.push(card('Machine', [
+    row('CPU', `${s.cpu_pct}% of ${s.cpu_count} cores`, s.cpu_pct > 85 ? 'bad' : s.cpu_pct > 60 ? 'warn' : ''),
+    row('Load', (s.load_avg || []).join(' / ')), row('Memory', s.memory ? `${s.memory.used_pct}% of ${s.memory.total_gb} GB` : '—'),
+    row('Browse requests now', d.browse_requests_in_flight), row('Cache workers', d.cache_job_workers),
+    row('ffmpeg / exiftool', `${d.tools && d.tools.ffmpeg ? 'ok' : 'MISSING'} / ${d.tools && d.tools.exiftool ? 'ok' : 'MISSING'}`, d.tools && d.tools.ffmpeg && d.tools.exiftool ? 'ok' : 'bad'),
+  ]));
+  const jobs = d.cache_jobs || [];
+  cards.push(card('Cache jobs', jobs.length ? jobs.map(j => row(j.folder,
+    `${j.done}/${j.total}${j.errors ? ` (${j.errors} errors)` : ''} · ${j.finished ? 'finished' : (j.per_min ? `${j.per_min}/min, ~${j.eta_min} min left` : 'starting')}`,
+    j.errors ? 'warn' : '')) : [row('None', '')]));
+  const slow = d.slow_requests || [];
+  cards.push(card('Slow requests (2s+)', slow.length ? slow.slice(0, 15).map(r => row(r.at, `${r.secs}s · ${r.status} · ${decodeURIComponent(r.path)}`, r.secs > 6 ? 'bad' : 'warn')) : [row('None', '', 'ok')]));
+  document.getElementById('grid').innerHTML = cards.join('');
+  document.getElementById('log').textContent = (d.log_tail || ['(no log available)']).join('\\n');
+}
+load(); setInterval(load, 15000);
+</script></body></html>"""
 
 
 def _get_system_stats() -> dict:

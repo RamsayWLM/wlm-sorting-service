@@ -19,6 +19,7 @@ iCloud Drive, ...) the moment it's scanned, instead of once for the one
 folder the client actually agreed to.
 """
 import atexit
+import collections
 import hashlib
 import json
 import os
@@ -41,7 +42,7 @@ from tkinter import filedialog, messagebox
 
 from PIL import Image, ImageTk
 
-APP_VERSION = "1.7.2"
+APP_VERSION = "1.7.3"
 
 # Public GitHub repo hosting release builds for self-update -- no auth token
 # needed for the unauthenticated "latest release" read, at the cost of the
@@ -98,6 +99,87 @@ CONFIG_DIR = Path.home() / 'Library' / 'Application Support' / 'WLM Sorting Serv
 CONFIG_FILE = CONFIG_DIR / 'config.json'
 
 WLM_TAILSCALE_SHARE_EMAIL = "whitelightsmediauk@gmail.com"
+
+# ── Log capture ───────────────────────────────────────────────────────────────
+# A double-clicked .app's stdout/stderr go nowhere, so every print() here (the
+# updater's included) used to vanish -- an update that failed to install left
+# no trace anyone could see. Now kept in memory for the web sitrep page and in
+# a small rotating file in the app-support folder.
+LOG_FILE = CONFIG_DIR / 'service.log'
+_LOG_MAX_BYTES = 5_000_000
+_LOG_TAIL: 'collections.deque[str]' = collections.deque(maxlen=300)
+_log_mu = threading.Lock()
+
+
+class _TeeStream:
+    def __init__(self, original):
+        self._orig = original
+        self._partial = ''
+
+    def write(self, text):
+        if self._orig is not None:
+            try:
+                self._orig.write(text)
+            except Exception:
+                pass
+        with _log_mu:
+            self._partial += text
+            *lines, self._partial = self._partial.split('\n')
+            if not lines:
+                return len(text)
+            stamp = time.strftime('%m-%d %H:%M:%S')
+            stamped = [f'{stamp} {ln}' for ln in lines if ln.strip()]
+            _LOG_TAIL.extend(stamped)
+            try:
+                CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+                if LOG_FILE.exists() and LOG_FILE.stat().st_size > _LOG_MAX_BYTES:
+                    os.replace(LOG_FILE, LOG_FILE.with_suffix('.log.1'))
+                with LOG_FILE.open('a') as f:
+                    f.write(''.join(ln + '\n' for ln in stamped))
+            except Exception:
+                pass
+        return len(text)
+
+    def flush(self):
+        if self._orig is not None:
+            try:
+                self._orig.flush()
+            except Exception:
+                pass
+
+    def isatty(self):
+        return False
+
+
+sys.stdout = _TeeStream(sys.stdout)
+sys.stderr = _TeeStream(sys.stderr)
+_STARTED_AT = time.time()
+
+# Outcome of the most recent update check, shown on the sitrep page.
+_UPDATE_STATUS = {'last_check': None, 'result': 'not checked yet', 'error': None, 'latest_seen': None}
+
+
+def _set_update_status(result, error=None, latest=None):
+    _UPDATE_STATUS.update(last_check=time.strftime('%Y-%m-%d %H:%M:%S'), result=result, error=error)
+    if latest:
+        _UPDATE_STATUS['latest_seen'] = latest
+    print(f"[update] {result}" + (f" -- {error}" if error else ''), flush=True)
+
+
+def _bundle_info() -> dict:
+    """Where the running .app lives, and whether the updater can replace it
+    there. macOS runs an app opened straight from Downloads (still quarantined)
+    from a randomized read-only copy ("App Translocation"), where the updater's
+    rename-swap can never succeed."""
+    if not getattr(sys, 'frozen', False):
+        return {'path': os.path.abspath(__file__), 'dev_mode': True}
+    app_path = Path(sys.executable).resolve().parents[2]
+    return {
+        'path': str(app_path),
+        'translocated': '/AppTranslocation/' in str(app_path),
+        'writable': os.access(app_path.parent, os.W_OK),
+        'in_applications': str(app_path.parent) in ('/Applications', str(Path.home() / 'Applications')),
+    }
 
 SETUP_STEPS_TEXT = (
     "1. Download and install Tailscale (button below). macOS will ask for "
@@ -241,15 +323,23 @@ def _check_and_apply_update():
 
         remote_version = release.get('tag_name', '')
         if _parse_version(remote_version) <= _parse_version(APP_VERSION):
+            _set_update_status(f'up to date (latest release {remote_version})', latest=remote_version)
             return  # already current (or the tag is malformed -- do nothing either way)
 
         zip_asset = next((a for a in release.get('assets', []) if a['name'].endswith('.zip')), None)
         if not zip_asset:
+            _set_update_status(f'{remote_version} available but has no .zip asset', error='no zip asset', latest=remote_version)
+            return
+        info = _bundle_info()
+        if info.get('translocated'):
+            _set_update_status(f'{remote_version} available, cannot install',
+                               error='app is running from a quarantined copy -- move it to Applications and reopen',
+                               latest=remote_version)
             return
 
         checksum_match = re.search(r'sha256:\s*([0-9a-fA-F]{64})', release.get('body') or '', re.IGNORECASE)
         if not checksum_match:
-            print(f"[update] {remote_version} has no sha256 in its release notes -- refusing to install unverified.", flush=True)
+            _set_update_status(f'{remote_version} not installed', error='no sha256 in release notes', latest=remote_version)
             return
         expected_sha256 = checksum_match.group(1).lower()
 
@@ -268,7 +358,9 @@ def _check_and_apply_update():
 
             actual_sha256 = hashlib.sha256(zip_path.read_bytes()).hexdigest()
             if actual_sha256 != expected_sha256:
-                print(f"[update] Checksum mismatch (got {actual_sha256}, expected {expected_sha256}) -- aborting.", flush=True)
+                _set_update_status(f'{remote_version} not installed',
+                                   error=f'checksum mismatch (got {actual_sha256[:12]}…, expected {expected_sha256[:12]}…)',
+                                   latest=remote_version)
                 return
 
             extract_dir = Path(tmp) / 'extracted'
@@ -276,7 +368,7 @@ def _check_and_apply_update():
                 z.extractall(extract_dir)
             new_app = next(extract_dir.glob('*.app'), None)
             if not new_app:
-                print("[update] Release zip has no .app bundle inside -- aborting.", flush=True)
+                _set_update_status(f'{remote_version} not installed', error='release zip has no .app inside', latest=remote_version)
                 return
 
             current_app = Path(sys.executable).resolve().parents[2]
@@ -300,10 +392,10 @@ def _check_and_apply_update():
             staged.rename(current_app)
             shutil.rmtree(old, ignore_errors=True)
 
-        print(f"[update] Installed {remote_version} -- relaunching.", flush=True)
+        _set_update_status(f'installed {remote_version}, relaunching', latest=remote_version)
         _restart_app()
     except Exception as e:
-        print(f"[update] Check/install failed, staying on {APP_VERSION}: {e}", flush=True)
+        _set_update_status(f'check/install failed, staying on {APP_VERSION}', error=f'{type(e).__name__}: {e}')
 
 
 def _run_update_watcher(shell):
@@ -407,6 +499,24 @@ def _import_server_app(photos_dir: str):
     os.environ.setdefault('THUMB_DIR', str(CONFIG_DIR / 'thumbs'))
     global server_app
     import app as server_app
+    server_app.SITREP_PROVIDER = _sitrep_shell_info
+    # One access-log line per request (hundreds per folder of thumbnails) would
+    # bury everything useful in the captured log; slow ones are tracked on the
+    # sitrep page separately.
+    import logging
+    logging.getLogger('werkzeug').setLevel(logging.WARNING)
+
+
+def _sitrep_shell_info() -> dict:
+    return {
+        'app_version': APP_VERSION,
+        'app_uptime_min': round((time.time() - _STARTED_AT) / 60, 1),
+        'bundle': _bundle_info(),
+        'update': dict(_UPDATE_STATUS),
+        'launch_at_login': LAUNCH_AGENT_PLIST.exists(),
+        'log_file': str(LOG_FILE),
+        'log_tail': list(_LOG_TAIL)[-150:],
+    }
 
 
 class ServiceShell:
