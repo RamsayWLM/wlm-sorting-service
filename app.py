@@ -497,6 +497,8 @@ def _run(cmd: list[str], **kwargs):
     return subprocess.run(cmd, preexec_fn=preexec, **kwargs)
 
 
+_CACHE_JOB_WORKERS = max(4, min(6, (os.cpu_count() or 4) - 2))
+
 _LARGE_CACHE_JOB_THRESHOLD = 2000  # files -- above this, a Generate Cache job is treated
 # as bulk background work rather than a fast, actively-awaited request. Well below what a
 # single event folder is (150k+ is normal), well above a normal "cache this one folder
@@ -775,8 +777,35 @@ def _thumb_path(rel: str) -> Path:
 
 
 def _make_thumb(src: Path, dst: Path) -> bool:
+    # Written to a temp name and renamed into place, so a restart or crash
+    # mid-write can't leave a truncated thumbnail that then counts as done.
+    tmp = dst.with_name(dst.name + '.part.jpg')  # .jpg last: ffmpeg picks format by extension
     with _thumb_gen_sema:
-        return _make_thumb_impl(src, dst)
+        try:
+            ok = _make_thumb_impl(src, tmp) and tmp.exists()
+            if ok:
+                os.replace(tmp, dst)
+            return ok
+        finally:
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+
+
+def _thumb_ok(dst: Path, src: Path) -> bool:
+    """Thumbnail exists, is newer than its source, and is a complete JPEG
+    (ends with the EOI marker) -- catches ones truncated by a pre-1.7.1 build
+    being killed mid-write, which would otherwise never get regenerated."""
+    try:
+        st = dst.stat()
+        if st.st_mtime < src.stat().st_mtime or st.st_size < 100:
+            return False
+        with dst.open('rb') as f:
+            f.seek(-2, os.SEEK_END)
+            return f.read(2) == b'\xff\xd9'
+    except OSError:
+        return False
 
 
 def _make_thumb_impl(src: Path, dst: Path) -> bool:
@@ -789,14 +818,16 @@ def _make_thumb_impl(src: Path, dst: Path) -> bool:
             # Extract embedded JPEG preview — camera already baked one in, ~100x faster than decoding RAW
             if HAS_PILLOW:
                 # Read orientation from the RAW file itself (embedded JPEGs often lack this tag)
-                raw_orient = 1
-                try:
-                    ro_out = _run_exiftool(['-Orientation#', '-s3', str(src)], timeout=5)
-                    ro_str = ro_out.decode(errors='ignore').strip() if ro_out is not None else ''
-                    if ro_str.isdigit():
-                        raw_orient = int(ro_str)
-                except Exception:
-                    pass
+                # Looked up lazily: a second exiftool launch per file is a real
+                # share of the per-file cost, and is only needed when the
+                # embedded preview carries no orientation of its own.
+                def _raw_orient():
+                    try:
+                        ro_out = _run_exiftool(['-Orientation#', '-s3', str(src)], timeout=5)
+                        ro_str = ro_out.decode(errors='ignore').strip() if ro_out is not None else ''
+                        return int(ro_str) if ro_str.isdigit() else 1
+                    except Exception:
+                        return 1
                 # -ThumbnailImage is the last resort: much lower resolution than a
                 # real preview, but some RAW formats (confirmed: Panasonic .rw2)
                 # only embed this and never JpegFromRaw/PreviewImage, which
@@ -807,6 +838,7 @@ def _make_thumb_impl(src: Path, dst: Path) -> bool:
                         r_out = _run_exiftool(['-b', tag, str(src)], timeout=30)
                         if r_out is not None and len(r_out) > 2000:
                             with Image.open(BytesIO(r_out)) as img:
+                                img.draft('RGB', (size, size))
                                 # Check if the embedded JPEG has its own orientation EXIF
                                 try:
                                     jpeg_exif = img._getexif() or {}
@@ -816,9 +848,11 @@ def _make_thumb_impl(src: Path, dst: Path) -> bool:
                                 if jpeg_orient != 1:
                                     # JPEG knows its own orientation — trust it
                                     img = ImageOps.exif_transpose(img)
-                                elif raw_orient in _EXIF_ORIENT_OPS:
+                                else:
                                     # JPEG has no orientation data — use RAW EXIF
-                                    img = img.transpose(_EXIF_ORIENT_OPS[raw_orient])
+                                    raw_orient = _raw_orient()
+                                    if raw_orient in _EXIF_ORIENT_OPS:
+                                        img = img.transpose(_EXIF_ORIENT_OPS[raw_orient])
                                 img.thumbnail((size, size), Image.LANCZOS)
                                 if img.mode != 'RGB':
                                     img = img.convert('RGB')
@@ -856,6 +890,7 @@ def _make_thumb_impl(src: Path, dst: Path) -> bool:
             return dst.exists()
         elif HAS_PILLOW:
             with Image.open(src) as img:
+                img.draft('RGB', (size, size))  # decode at reduced scale, still >= size
                 img = ImageOps.exif_transpose(img)
                 img.thumbnail((size, size), Image.LANCZOS)
                 if img.mode != 'RGB':
@@ -872,10 +907,10 @@ def _serve_thumb(rel: str):
     if not src.is_file():
         abort(404)
     dst = _thumb_path(rel)
-    need_gen = not dst.exists() or dst.stat().st_mtime < src.stat().st_mtime
+    need_gen = not _thumb_ok(dst, src)
     if need_gen:
         with _lock(rel):
-            need_gen = not dst.exists() or dst.stat().st_mtime < src.stat().st_mtime
+            need_gen = not _thumb_ok(dst, src)
             if need_gen:
                 ok = _make_thumb(src, dst)
                 if not ok:
@@ -1038,7 +1073,7 @@ def _cache_folder_worker(job_id: str, folder: str):
         _wait_for_interactive_idle()
         src = BASE / rel
         dst = _thumb_path(rel)
-        if not dst.exists() or dst.stat().st_mtime < src.stat().st_mtime:
+        if not _thumb_ok(dst, src):
             ok = _make_thumb(src, dst)
         else:
             ok = True
@@ -1051,7 +1086,10 @@ def _cache_folder_worker(job_id: str, folder: str):
                 _jobs[job_id]['done'] = done_count
                 _jobs[job_id]['errors'] = error_count
 
-    with ThreadPoolExecutor(max_workers=4) as pool:
+    # Measured live on a client Mac: 4 workers ran at ~17% CPU, ~0.8 files/s --
+    # mostly waiting on per-file process launches and disk reads, not CPU. Stays
+    # under _thumb_gen_sema (8) so on-demand grid thumbnails always get a slot.
+    with ThreadPoolExecutor(max_workers=_CACHE_JOB_WORKERS) as pool:
         pool.map(_process, media_files)
 
     meta = _load_cache_meta()
@@ -1127,7 +1165,10 @@ def _regenerate_all_worker(job_id: str, folders: list):
                 _jobs[job_id]['done'] = done_count
                 _jobs[job_id]['errors'] = error_count
 
-    with ThreadPoolExecutor(max_workers=4) as pool:
+    # Measured live on a client Mac: 4 workers ran at ~17% CPU, ~0.8 files/s --
+    # mostly waiting on per-file process launches and disk reads, not CPU. Stays
+    # under _thumb_gen_sema (8) so on-demand grid thumbnails always get a slot.
+    with ThreadPoolExecutor(max_workers=_CACHE_JOB_WORKERS) as pool:
         pool.map(_process, media_files)
 
     meta = _load_cache_meta()
@@ -1370,7 +1411,7 @@ def cache_dir():
 def photos_in(folder):
     path = _resolve_dir(folder)
     path_key = str(path.resolve())
-    limit = request.args.get('limit', 3000, type=int)
+    limit = request.args.get('limit', 20000, type=int)  # grid renders in pages, so a whole big event folder is fine
     now = time.time()
 
     nocache = request.args.get('nocache', '0') == '1'
