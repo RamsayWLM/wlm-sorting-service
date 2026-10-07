@@ -1083,7 +1083,18 @@ async function _idbGet(storeName, key) {
   });
 }
 
-async function api(url) {
+// Folder-tree and photo listings can legitimately take a long time on a busy
+// client drive (a big folder while thumbnails generate measured ~50s), so they
+// get a long timeout -- and a timeout there means "slow", not "offline": the
+// periodic health check stays the one thing that decides offline mode.
+const _SLOW_LISTING_TIMEOUT_MS = 120000;
+
+async function api(url, opts = {}) {
+  const slow = !!opts.slow;
+  const _maybeOffline = (e) => {
+    if (slow && e && e.name === 'AbortError') return;
+    _setOffline(true, _classifyFetchError(e));
+  };
   // If we already know we're offline (the periodic health-check already
   // failed), don't spend up to 6s re-discovering that on every single
   // folder click before falling back -- go straight to the stored copy.
@@ -1095,7 +1106,7 @@ async function api(url) {
   }
 
   const live = (async () => {
-    const r = await _fetchWithTimeout(url, {}, 6000);
+    const r = await _fetchWithTimeout(url, {}, slow ? _SLOW_LISTING_TIMEOUT_MS : 6000);
     if (!r.ok) throw new Error(r.status);
     const data = await r.json();
     // Opportunistically remember every listing we successfully fetch (folder
@@ -1111,7 +1122,7 @@ async function api(url) {
     try {
       return await live;
     } catch (e) {
-      _setOffline(true, _classifyFetchError(e));
+      _maybeOffline(e);
       throw e;
     }
   }
@@ -1121,7 +1132,7 @@ async function api(url) {
   // thumbnails) even though the network itself is fine -- race the live
   // fetch against a short deadline and use the cached copy if live hasn't
   // won by then. The live fetch keeps running in the background regardless.
-  live.then(() => _setOffline(false)).catch((e) => _setOffline(true, _classifyFetchError(e)));
+  live.then(() => _setOffline(false)).catch(_maybeOffline);
   return Promise.race([
     live,
     new Promise(resolve => setTimeout(() => resolve(cached), 500)),
@@ -1480,18 +1491,28 @@ function switchLocation(loc) {
 }
 
 async function initFolders() {
+  // Only speak up if it's actually slow -- a normal load is well under this.
+  const slowNote = setTimeout(() => {
+    $('stateMsg').innerHTML = '<div class="spinner"></div>Loading folders… the drive is busy (thumbnails may be generating), this can take up to a minute';
+    $('stateMsg').style.display = 'flex';
+  }, 3000);
   try {
     if (_currentLocation) {
-      const children = await api(`/api/ls/${encPath(_currentLocation)}`);
+      const children = await api(`/api/ls/${encPath(_currentLocation)}`, { slow: true });
       allFolders = children.map(f => ({ ...f, name: `${_currentLocation}/${f.name}` }));
     } else {
-      const rootFolders = await api('/api/ls');
+      const rootFolders = await api('/api/ls', { slow: true });
       allFolders = rootFolders.filter(f => !_EXTRA_LOCATIONS.includes(f.name));
     }
     _populateLocationSelect();
     renderFolders(allFolders);
+    if (!currentFolder) $('stateMsg').textContent = 'Select a folder';
   } catch(e) {
-    $('stateMsg').textContent = 'Failed to connect to server';
+    $('stateMsg').textContent = _isOffline
+      ? 'Failed to connect to server'
+      : 'Folders took too long to load — the drive is very busy. Refresh to try again.';
+  } finally {
+    clearTimeout(slowNote);
   }
   return true;
 }
@@ -2305,8 +2326,12 @@ async function selectFolder(name, el) {
 
   if (cacheFresh) return; // refreshed recently enough -- don't hit the network again yet
 
+  const slowNote = cached ? null : setTimeout(() => {
+    if (currentFolder !== name) return;
+    $('stateMsg').innerHTML = '<div class="spinner"></div>Loading photos… big folder on a busy drive, this can take up to a minute';
+  }, 4000);
   try {
-    const resp = await api(`/api/photos-in/${encPath(name)}`);
+    const resp = await api(`/api/photos-in/${encPath(name)}`, { slow: true });
     _folderListCache.set(name, { resp, ts: Date.now() });
     // Only re-render if still viewing this folder -- user may have navigated
     // away while this background refresh was in flight.
@@ -2320,9 +2345,11 @@ async function selectFolder(name, el) {
     if (hasIncoming) {
       if (currentFolder === name) _applyListing([]);
     } else if (!cached) {
-      $('stateMsg').textContent = _isOffline ? 'Offline — this folder hasn\'t been viewed yet' : 'Failed to load photos';
+      $('stateMsg').textContent = _isOffline ? 'Offline — this folder hasn\'t been viewed yet' : 'Photos took too long to load — the drive is very busy. Click the folder again to retry.';
       $('stateMsg').style.display = 'flex';
     }
+  } finally {
+    clearTimeout(slowNote);
   }
 }
 

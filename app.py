@@ -458,6 +458,18 @@ def _read_ts(path: Path) -> int | None:
     except Exception:
         return None
 
+# Capture timestamps by absolute path. Reading one means opening the file, which
+# on a busy external drive made a 7k-file /api/photos-in time out in the browser.
+# Filled by the cache workers (they're reading the file anyway) and by listings.
+_ts_cache: dict[str, int | None] = {}
+_PHOTOS_IN_TS_BUDGET = 4.0  # seconds of EXIF reads per listing before falling back to mtime
+
+def _cached_ts(path: Path) -> int | None:
+    key = str(path)
+    if key not in _ts_cache:
+        _ts_cache[key] = _read_ts(path)
+    return _ts_cache[key]
+
 _locks: dict[str, threading.Lock] = {}
 _locks_mu = threading.Lock()
 
@@ -489,6 +501,38 @@ _LARGE_CACHE_JOB_THRESHOLD = 2000  # files -- above this, a Generate Cache job i
 # as bulk background work rather than a fast, actively-awaited request. Well below what a
 # single event folder is (150k+ is normal), well above a normal "cache this one folder
 # I'm about to use" click.
+
+# Interactive requests (folder tree, photo listings, grid thumbnails) currently in
+# flight. Bulk cache work checks this before each file and steps aside while it's
+# non-zero. The load-average check below only catches CPU contention -- on a client's
+# external SSD/HDD the bottleneck is disk I/O, where a 4-worker cache job made a
+# 2-folder /api/ls take ~50s (observed live, Oct 2026), past the browser's timeout.
+_interactive_inflight = 0
+_interactive_mu = threading.Lock()
+_INTERACTIVE_ENDPOINTS = {'ls', 'photos_in', 'thumb', 'search_folders'}
+
+@app.before_request
+def _mark_interactive_start():
+    global _interactive_inflight
+    if request.endpoint in _INTERACTIVE_ENDPOINTS:
+        with _interactive_mu:
+            _interactive_inflight += 1
+        request._wlm_interactive = True
+
+@app.teardown_request
+def _mark_interactive_end(_exc):
+    global _interactive_inflight
+    if getattr(request, '_wlm_interactive', False):
+        with _interactive_mu:
+            _interactive_inflight -= 1
+
+def _wait_for_interactive_idle(max_wait=20.0):
+    """Pause bulk work while someone is browsing. Capped so a constantly-busy UI
+    slows the background job down rather than stopping it outright."""
+    waited = 0.0
+    while _interactive_inflight > 0 and waited < max_wait:
+        time.sleep(0.1)
+        waited += 0.1
 
 def _wait_for_load_headroom():
     """Block briefly while the system is under heavy load, so large/bulk background
@@ -681,15 +725,7 @@ def _build_dir_tree():
                 new_counts[str(root_path)] = {'p': p, 'v': v}
             children = []
             for d in dirs:
-                child = root_path / d
-                try:
-                    has_children = any(
-                        p2.is_dir() and not p2.name.startswith('.')
-                        for p2 in child.iterdir()
-                    )
-                except OSError:
-                    has_children = False
-                children.append({'name': d, 'hasChildren': has_children})
+                children.append({'name': d, 'hasChildren': _has_subdirs(root_path / d)})
             new_tree[str(root_path)] = children
     except Exception:
         pass
@@ -854,14 +890,22 @@ def clean_name(folder: str) -> str:
 
 
 def list_dirs(path: Path) -> list[str]:
+    # scandir's is_dir() answers from the directory entry itself, no per-entry
+    # stat() -- matters on a busy external drive where each stat can cost ms.
     try:
-        return sorted(
-            (e for e in os.listdir(path)
-             if (path / e).is_dir() and not e.startswith('.')),
-            key=_nat
-        )
+        with os.scandir(path) as it:
+            names = [e.name for e in it if not e.name.startswith('.') and e.is_dir()]
+        return sorted(names, key=_nat)
     except OSError:
         return []
+
+
+def _has_subdirs(path: Path) -> bool:
+    try:
+        with os.scandir(path) as it:
+            return any(not e.name.startswith('.') and e.is_dir() for e in it)
+    except OSError:
+        return False
 
 
 def list_media(path: Path) -> list[str]:
@@ -991,12 +1035,14 @@ def _cache_folder_worker(job_id: str, folder: str):
         if is_large:
             _priority_local.background = True
             _wait_for_load_headroom()
+        _wait_for_interactive_idle()
         src = BASE / rel
         dst = _thumb_path(rel)
         if not dst.exists() or dst.stat().st_mtime < src.stat().st_mtime:
             ok = _make_thumb(src, dst)
         else:
             ok = True
+        _cached_ts(src)  # so opening this folder mid-job doesn't re-read every file
         with count_lock:
             done_count += 1
             if not ok:
@@ -1058,6 +1104,7 @@ def _regenerate_all_worker(job_id: str, folders: list):
         nonlocal done_count, error_count
         _priority_local.background = True
         _wait_for_load_headroom()
+        _wait_for_interactive_idle()
         src = BASE / rel
         dst = _thumb_path(rel)
         tmp = dst.with_name(dst.name + f'.regen{job_id}.tmp')
@@ -1135,6 +1182,7 @@ def _watch_tick():
         nonlocal done_count
         _priority_local.background = True
         _wait_for_load_headroom()
+        _wait_for_interactive_idle()
         rel, fk = item
         ok = _make_thumb(BASE / rel, _thumb_path(rel))
         with count_lock:
@@ -1267,15 +1315,7 @@ def ls(folder=''):
     # Always read from disk so newly created folders appear immediately
     result = []
     for name in list_dirs(path):
-        child = path / name
-        try:
-            has_children = any(
-                p.is_dir() and not p.name.startswith('.')
-                for p in child.iterdir()
-            )
-        except OSError:
-            has_children = False
-        result.append({'name': name, 'hasChildren': has_children})
+        result.append({'name': name, 'hasChildren': _has_subdirs(path / name)})
     with _dir_tree_mu:
         _dir_tree[str(path)] = result
     return jsonify(result)
@@ -1341,6 +1381,8 @@ def photos_in(folder):
     entries: list[tuple[int, dict]] = []
     ratings_cache: dict[str, dict] = {}
     truncated = False
+    ts_deadline = time.monotonic() + _PHOTOS_IN_TS_BUDGET
+    ts_partial = False
 
     for root, dirs, files in os.walk(str(path)):
         dirs[:] = sorted((d for d in dirs if not d.startswith('.')), key=_nat)
@@ -1378,7 +1420,15 @@ def photos_in(folder):
                     break
                 rel = str((root_path / f).relative_to(BASE))
                 entry = ratings.get(f, {})
-                ts = _read_ts(root_path / f) or 0
+                fp = root_path / f
+                if str(fp) in _ts_cache or time.monotonic() < ts_deadline:
+                    ts = _cached_ts(fp) or 0
+                else:
+                    ts_partial = True
+                    try:
+                        ts = int(fp.stat().st_mtime)
+                    except OSError:
+                        ts = 0
                 item = {
                     'path':    rel,
                     'name':    f,
@@ -1400,7 +1450,10 @@ def photos_in(folder):
     result = [item for _, item in entries]
 
     data = {'items': result, 'truncated': truncated, 'limit': limit}
-    _listing_cache[path_key] = {'data': data, 'ts': now}
+    # A listing ordered partly by mtime isn't cached, so the next open re-sorts with
+    # the capture times read since (each listing reads more within its budget).
+    if not ts_partial:
+        _listing_cache[path_key] = {'data': data, 'ts': now}
     return jsonify(data)
 
 
